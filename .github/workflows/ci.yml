@@ -4,6 +4,10 @@ on:
   pull_request:
     types: [opened, reopened]
 
+permissions:
+  contents: read
+  packages: write
+
 env:
   REGISTRY: ghcr.io
 
