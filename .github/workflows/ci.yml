@@ -85,13 +85,14 @@ jobs:
       - name: Create image ref and version
         id: image-ref
         run: |
+          REPO=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
           REF=$(git rev-parse --short $GITHUB_SHA)
           # Get version from git tags or use commit-based version
           VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev-${REF}")
-          IMAGE=${{ env.REGISTRY }}/${{ github.repository }}:${REF}
-          IMAGE_LATEST=${{ env.REGISTRY }}/${{ github.repository }}:latest
-          IMAGE_JRE=${{ env.REGISTRY }}/${{ github.repository }}/jre:${REF}
-          IMAGE_JRE_LATEST=${{ env.REGISTRY }}/${{ github.repository }}/jre:latest
+          IMAGE=${{ env.REGISTRY }}/${REPO}:${REF}
+          IMAGE_LATEST=${{ env.REGISTRY }}/${REPO}:latest
+          IMAGE_JRE=${{ env.REGISTRY }}/${REPO}/jre:${REF}
+          IMAGE_JRE_LATEST=${{ env.REGISTRY }}/${REPO}/jre:latest
 
           echo "image=${IMAGE}" >> $GITHUB_OUTPUT
           echo "image_latest=${IMAGE_LATEST}" >> $GITHUB_OUTPUT
@@ -102,8 +103,8 @@ jobs:
           # If building from a tag, extract the version tag for docker tagging
           if [[ $GITHUB_REF == refs/tags/* ]]; then
             VERSION_TAG=${GITHUB_REF#refs/tags/}
-            IMAGE_VERSION=${{ env.REGISTRY }}/${{ github.repository }}:${VERSION_TAG}
-            IMAGE_JRE_VERSION=${{ env.REGISTRY }}/${{ github.repository }}/jre:${VERSION_TAG}
+            IMAGE_VERSION=${{ env.REGISTRY }}/${REPO}:${VERSION_TAG}
+            IMAGE_JRE_VERSION=${{ env.REGISTRY }}/${REPO}/jre:${VERSION_TAG}
             echo "image_version=${IMAGE_VERSION}" >> $GITHUB_OUTPUT
             echo "image_jre_version=${IMAGE_JRE_VERSION}" >> $GITHUB_OUTPUT
             echo "version_tag=${VERSION_TAG}" >> $GITHUB_OUTPUT
