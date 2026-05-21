@@ -1,6 +1,9 @@
 package raknet
 
-import "testing"
+import (
+	"encoding/binary"
+	"testing"
+)
 
 func TestReceivePacketOrdersByChannel(t *testing.T) {
 	conn := &Conn{packets: make(chan *Frame, 4)}
@@ -26,5 +29,19 @@ func TestReceivePacketOrdersByChannel(t *testing.T) {
 		default:
 			t.Fatalf("frame %d was not delivered", i)
 		}
+	}
+}
+
+func TestRaknetifySyncFrameUsesNextOutgoingSequenceID(t *testing.T) {
+	conn := &Conn{seq: 42}
+
+	frame := conn.RaknetifySyncFrame()
+	payload := frame.Payload
+	gotSeq := binary.BigEndian.Uint32(payload[len(payload)-4:])
+	if gotSeq != 42 {
+		t.Fatalf("sync sequence id = %d, want 42", gotSeq)
+	}
+	if frame.Reliability != ReliabilityReliable {
+		t.Fatalf("sync reliability = %d, want %d", frame.Reliability, ReliabilityReliable)
 	}
 }

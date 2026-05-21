@@ -36,15 +36,17 @@ type raknetSyncFrameConn interface {
 type raknetifyConn struct {
 	conn raknetFrameConn
 
-	readMu  sync.Mutex
-	readBuf bytes.Buffer
+	readMu         sync.Mutex
+	readBuf        bytes.Buffer
+	preRead        []*raknet.Frame
+	capturePreRead bool
 
 	writeMu  sync.Mutex
 	writeBuf []byte
 }
 
 func newRaknetifyConn(conn raknetFrameConn) net.Conn {
-	return &raknetifyConn{conn: conn}
+	return &raknetifyConn{conn: conn, capturePreRead: true}
 }
 
 func (c *raknetifyConn) Read(p []byte) (int, error) {
@@ -72,8 +74,9 @@ func (c *raknetifyConn) Read(p []byte) (int, error) {
 			raknetifyMetricsSyncPacketID,
 			raknetifyStreamingCompressionPacketID,
 			raknetifyStreamingCompressionHandshakePacketID:
-			// Gate Lite deliberately does not start Raknetify multi-channeling or
-			// streaming compression. Control packets from the client are ignored.
+			if c.capturePreRead {
+				c.preRead = append(c.preRead, cloneRaknetFrame(frame))
+			}
 			continue
 		default:
 			continue
@@ -158,6 +161,39 @@ func (c *raknetifyConn) SetWriteDeadline(t time.Time) error {
 
 func (c *raknetifyConn) FrameConn() raknetFrameConn {
 	return c.conn
+}
+
+func (c *raknetifyConn) DrainBufferedFrames() []*raknet.Frame {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
+	frames := c.preRead
+	c.preRead = nil
+	c.capturePreRead = false
+	return frames
+}
+
+func (c *raknetifyConn) SetBufferedFrameCapture(enabled bool) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
+	c.capturePreRead = enabled
+	if !enabled {
+		c.preRead = nil
+	}
+}
+
+func cloneRaknetFrame(frame *raknet.Frame) *raknet.Frame {
+	if frame == nil {
+		return nil
+	}
+	payload := make([]byte, len(frame.Payload))
+	copy(payload, frame.Payload)
+	return &raknet.Frame{
+		Payload:      payload,
+		Reliability:  frame.Reliability,
+		OrderChannel: frame.OrderChannel,
+	}
 }
 
 var _ net.Conn = (*raknetifyConn)(nil)

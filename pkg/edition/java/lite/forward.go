@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/jellydator/ttlcache/v3"
+	"go.minekube.com/common/minecraft/component"
 	"go.minekube.com/gate/pkg/edition/java/internal/protoutil"
 	"go.minekube.com/gate/pkg/edition/java/lite/config"
 	"go.minekube.com/gate/pkg/edition/java/netmc"
@@ -90,6 +91,11 @@ func forwardWithDialer(
 		forwardRaknetifyPassthrough(dialTimeout, log, client, route, nextBackend, handshake, pc, backendTCPBrutal)
 		return
 	}
+	if raknetifyClient {
+		if buffered, ok := netmc.Assert[interface{ SetBufferedFrameCapture(bool) }](client); ok {
+			buffered.SetBufferedFrameCapture(false)
+		}
+	}
 
 	// Find a backend to dial successfully.
 	backendAddr, log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, net.Conn, error) {
@@ -104,6 +110,16 @@ func forwardWithDialer(
 	if err = emptyReadBuff(client, dst); err != nil {
 		errs.V(log, err).Info("failed to empty client buffer", "error", err)
 		return
+	}
+	if raknetifyClient && route.RaknetifyMode() == config.RaknetifyModeTranslate {
+		ok, err := guardRaknetifyTranslateLogin(log, client, src, dst)
+		if err != nil {
+			errs.V(log, err).Info("failed to prepare Raknetify translate login", "error", err)
+			return
+		}
+		if !ok {
+			return
+		}
 	}
 
 	// Track connection for least-connections strategy
@@ -134,9 +150,13 @@ func forwardRaknetifyPassthrough(
 		return
 	}
 	src := srcConn.FrameConn()
+	var preReadFrames []*raknet.Frame
+	if buffered, ok := netmc.Assert[interface{ DrainBufferedFrames() []*raknet.Frame }](client); ok {
+		preReadFrames = buffered.DrainBufferedFrames()
+	}
 
 	backendAddr, log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, raknetFrameConn, error) {
-		conn, err := dialRaknetifyRoute(client.Context(), dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, backendTCPBrutal)
+		conn, err := dialRaknetifyRoute(client.Context(), dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, preReadFrames, backendTCPBrutal)
 		return log, conn, err
 	})
 	if err != nil {
@@ -218,6 +238,7 @@ func dialRaknetifyRoute(
 	backendAddr string,
 	handshake *packet.Handshake,
 	handshakeCtx *proto.PacketContext,
+	preReadFrames []*raknet.Frame,
 	backendTCPBrutal tcpbrutal.Options,
 ) (dst raknetFrameConn, err error) {
 	if route.ProxyProtocol {
@@ -257,6 +278,11 @@ func dialRaknetifyRoute(
 	if route.GetTCPShieldRealIP() && IsTCPShieldRealIP(handshake.ServerAddress) {
 		handshake.ServerAddress = TCPShieldRealIP(handshake.ServerAddress, srcAddr)
 		update(handshakeCtx, handshake)
+	}
+	for _, frame := range preReadFrames {
+		if _, err = dst.WriteFrame(frame); err != nil {
+			return dst, fmt.Errorf("failed to write buffered Raknetify frame to backend: %w", err)
+		}
 	}
 
 	payload := make([]byte, 1+len(handshakeCtx.Payload))
@@ -308,6 +334,60 @@ func emptyReadBuff(src netmc.MinecraftConn, dst net.Conn) error {
 		}
 	}
 	return nil
+}
+
+func guardRaknetifyTranslateLogin(log logr.Logger, client netmc.MinecraftConn, src, dst net.Conn) (bool, error) {
+	if client.State() != state.Login {
+		return true, nil
+	}
+
+	readTimeout := 10 * time.Second
+	_ = dst.SetReadDeadline(time.Now().Add(readTimeout))
+	frame, packetID, err := readMinecraftPacketFrame(dst)
+	_ = dst.SetReadDeadline(time.Time{})
+	if err != nil {
+		return false, err
+	}
+	if packetID == 0x01 {
+		log.Info("rejecting Raknetify translate connection to online-mode backend; vanilla TCP stream encryption is incompatible with Raknetify frame encryption")
+		reason := &component.Text{Content: "Raknetify translate does not support online-mode vanilla backends. Use raknetify passthrough or disable backend online-mode."}
+		_ = netmc.CloseWith(client, packet.NewDisconnect(reason, client.Protocol(), client.State().State))
+		return false, nil
+	}
+	if _, err = src.Write(frame); err != nil {
+		return false, fmt.Errorf("failed to forward first backend login packet: %w", err)
+	}
+	return true, nil
+}
+
+func readMinecraftPacketFrame(rd io.Reader) ([]byte, int, error) {
+	var lengthBytes []byte
+	var result int32
+	for i := 0; i < 5; i++ {
+		var b [1]byte
+		if _, err := io.ReadFull(rd, b[:]); err != nil {
+			return nil, 0, fmt.Errorf("failed to read packet length: %w", err)
+		}
+		lengthBytes = append(lengthBytes, b[0])
+		result |= int32(b[0]&0x7f) << (7 * i)
+		if b[0]&0x80 == 0 {
+			length := int(result)
+			if length <= 0 || length > 1048576 {
+				return nil, 0, fmt.Errorf("received invalid packet length %d", length)
+			}
+			payload := make([]byte, length)
+			if _, err := io.ReadFull(rd, payload); err != nil {
+				return nil, 0, fmt.Errorf("failed to read packet payload: %w", err)
+			}
+			packetID, err := util.ReadVarInt(bytes.NewReader(payload))
+			if err != nil {
+				return nil, 0, fmt.Errorf("failed to read packet id: %w", err)
+			}
+			frame := append(lengthBytes, payload...)
+			return frame, packetID, nil
+		}
+	}
+	return nil, 0, errors.New("packet length varint is too big")
 }
 
 func pipe(log logr.Logger, src, dst net.Conn) {

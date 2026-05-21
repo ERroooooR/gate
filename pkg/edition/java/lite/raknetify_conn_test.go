@@ -66,7 +66,11 @@ func (a fakeAddr) String() string  { return string(a) }
 func TestRaknetifyConnReadUnwrapsGamePacket(t *testing.T) {
 	raw := &fakeRaknetPacketConn{
 		readFrames: []*raknet.Frame{
-			{Payload: []byte{raknetifyStreamingCompressionHandshakePacketID, 0x01}},
+			{
+				Payload:      []byte{raknetifyStreamingCompressionHandshakePacketID, 0x01},
+				Reliability:  raknet.ReliabilityReliable,
+				OrderChannel: 7,
+			},
 			{Payload: []byte{raknetifyGamePacketID, 0x00, 0x01, 0x02}},
 		},
 	}
@@ -80,6 +84,29 @@ func TestRaknetifyConnReadUnwrapsGamePacket(t *testing.T) {
 	require.NoError(t, util.WriteVarInt(&expected, 3))
 	expected.Write([]byte{0x00, 0x01, 0x02})
 	require.Equal(t, expected.Bytes(), buf[:n])
+
+	buffered := conn.(interface{ DrainBufferedFrames() []*raknet.Frame }).DrainBufferedFrames()
+	require.Len(t, buffered, 1)
+	require.Equal(t, []byte{raknetifyStreamingCompressionHandshakePacketID, 0x01}, buffered[0].Payload)
+	require.Equal(t, raknet.ReliabilityReliable, buffered[0].Reliability)
+	require.Equal(t, byte(7), buffered[0].OrderChannel)
+	require.Empty(t, conn.(interface{ DrainBufferedFrames() []*raknet.Frame }).DrainBufferedFrames())
+}
+
+func TestRaknetifyConnCanDisableControlFrameBuffering(t *testing.T) {
+	raw := &fakeRaknetPacketConn{
+		readFrames: []*raknet.Frame{
+			{Payload: []byte{raknetifyPingPacketID, 0x00}},
+			{Payload: []byte{raknetifyGamePacketID, 0x00}},
+		},
+	}
+	conn := newRaknetifyConn(raw)
+	conn.(interface{ SetBufferedFrameCapture(bool) }).SetBufferedFrameCapture(false)
+
+	buf := make([]byte, 2)
+	_, err := conn.Read(buf)
+	require.NoError(t, err)
+	require.Empty(t, conn.(interface{ DrainBufferedFrames() []*raknet.Frame }).DrainBufferedFrames())
 }
 
 func TestRaknetifyConnWriteWrapsMinecraftFrames(t *testing.T) {

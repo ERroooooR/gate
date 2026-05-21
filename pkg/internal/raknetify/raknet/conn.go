@@ -18,8 +18,12 @@ const (
 	// 9, while Bedrock's current RakNet protocol is 11.
 	currentProtocol byte = 9
 
-	maxMTUSize    = 1400
-	maxWindowSize = 2048
+	maxMTUSize                    = 1400
+	maxWindowSize                 = 2048
+	tickInterval                  = time.Millisecond * 50
+	raknetifyRetryDelay           = time.Millisecond * 50
+	raknetifyDefaultPendingFrames = 4
+	ackFlushThreshold             = raknetifyDefaultPendingFrames - 1
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -134,8 +138,7 @@ func newConnWithLimits(conn net.PacketConn, addr net.Addr, mtuSize uint16, limit
 // out.
 func (conn *Conn) startTicking() {
 	var (
-		interval = time.Second / 10
-		ticker   = time.NewTicker(interval)
+		ticker   = time.NewTicker(tickInterval)
 		i        int64
 		acksLeft int
 	)
@@ -145,15 +148,13 @@ func (conn *Conn) startTicking() {
 		case t := <-ticker.C:
 			i++
 			conn.flushACKs()
-			if i%2 == 0 {
+			if i%20 == 0 {
 				// We send a connected ping to calculate the rtt and let the
 				// other side know we haven't timed out.
 				conn.sendPing()
 			}
-			if i%3 == 0 {
-				conn.checkResend(t)
-			}
-			if i%5 == 0 {
+			conn.checkResend(t)
+			if i%10 == 0 {
 				conn.mu.Lock()
 				if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt()*2 {
 					// No activity for too long: Start timeout.
@@ -207,7 +208,7 @@ func (conn *Conn) checkResend(now time.Time) {
 	var (
 		resend []uint24
 		rtt    = conn.retransmission.rtt()
-		delay  = rtt + rtt/2
+		delay  = maxDuration(rtt+rtt/2, raknetifyRetryDelay)
 	)
 	conn.rtt.Store(int64(rtt))
 
@@ -219,6 +220,13 @@ func (conn *Conn) checkResend(now time.Time) {
 		}
 	}
 	_ = conn.resend(resend)
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // Write writes a buffer b over the RakNet connection. The amount of bytes
@@ -270,7 +278,7 @@ func (conn *Conn) RaknetifySyncFrame() *Frame {
 		buf.WriteByte(ch)
 		_ = binary.Write(buf, binary.BigEndian, int32(conn.orderIndex[ch])-1)
 	}
-	_ = binary.Write(buf, binary.BigEndian, int32(conn.seq)-1)
+	_ = binary.Write(buf, binary.BigEndian, int32(conn.seq))
 
 	return &Frame{
 		Payload:     buf.Bytes(),
@@ -558,11 +566,9 @@ func (conn *Conn) receiveDatagram(b *bytes.Buffer) error {
 	if err != nil {
 		return fmt.Errorf("error reading datagram sequence number: %v", err)
 	}
-	conn.ackMu.Lock()
-	// Add this sequence number to the received datagrams, so that it is
-	// included in an ACK.
-	conn.ackSlice = append(conn.ackSlice, seq)
-	conn.ackMu.Unlock()
+	if err = conn.queueACK(seq); err != nil {
+		return err
+	}
 
 	if !conn.win.new(seq) {
 		// Datagram was already received, this might happen if a packet took a long time to arrive, and we already sent
@@ -585,6 +591,23 @@ func (conn *Conn) receiveDatagram(b *bytes.Buffer) error {
 		return fmt.Errorf("datagram receive queue window size is too big (%v-%v)", conn.win.lowest, conn.win.highest)
 	}
 	return conn.handleDatagram(b)
+}
+
+func (conn *Conn) queueACK(seq uint24) error {
+	conn.ackMu.Lock()
+	defer conn.ackMu.Unlock()
+
+	// Add this sequence number to the received datagrams, so that it is
+	// included in an ACK.
+	conn.ackSlice = append(conn.ackSlice, seq)
+	if len(conn.ackSlice) < ackFlushThreshold {
+		return nil
+	}
+	if err := conn.sendACK(conn.ackSlice...); err != nil {
+		return err
+	}
+	conn.ackSlice = conn.ackSlice[:0]
+	return nil
 }
 
 // handleDatagram handles the contents of a datagram encoded in a bytes.Buffer.
