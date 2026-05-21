@@ -185,7 +185,7 @@ func dialRouteForMode(
 		return dialRoute(ctx, dialTimeout, log, srcAddr, route, backendAddr, handshake, handshakeCtx, forceUpdatePacketContext, backendTCPBrutal)
 	}
 	if route.ProxyProtocol {
-		return nil, fmt.Errorf("raknetify passthrough mode cannot use proxyProtocol")
+		log.V(1).Info("proxyProtocol is ignored for Raknetify passthrough backends", "backendAddr", backendAddr)
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
@@ -242,7 +242,7 @@ func dialRaknetifyRoute(
 	backendTCPBrutal tcpbrutal.Options,
 ) (dst raknetFrameConn, err error) {
 	if route.ProxyProtocol {
-		return nil, fmt.Errorf("raknetify passthrough mode cannot use proxyProtocol")
+		log.V(1).Info("proxyProtocol is ignored for Raknetify passthrough backends", "backendAddr", backendAddr)
 	}
 	if backendTCPBrutal.Enabled {
 		log.V(1).Info("TCP Brutal is ignored for Raknetify passthrough backends", "backendAddr", backendAddr)

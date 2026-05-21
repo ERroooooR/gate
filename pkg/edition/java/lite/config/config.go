@@ -154,9 +154,6 @@ func (c Config) Validate() (warns []error, errs []error) {
 			if !slices.Contains(allowedRaknetifyModes, ep.Raknetify.Mode) {
 				e("Route %d: invalid raknetify mode '%s', allowed: %v", i, ep.Raknetify.Mode, allowedRaknetifyModes)
 			}
-			if ep.Raknetify.Mode == RaknetifyModePassthrough && ep.ProxyProtocol {
-				e("Route %d: raknetify passthrough mode cannot be combined with proxyProtocol", i)
-			}
 		}
 
 		// Validate parameter usage in backend addresses

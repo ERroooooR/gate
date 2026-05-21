@@ -100,6 +100,26 @@ func TestConfigValidation_ValidStrategies(t *testing.T) {
 	}
 }
 
+func TestConfigValidation_AllowsRaknetifyPassthroughWithProxyProtocol(t *testing.T) {
+	cfg := config.Config{
+		Routes: []config.Route{
+			{
+				Host:          []string{"test.com"},
+				Backend:       []string{"server:25565"},
+				ProxyProtocol: true,
+				Raknetify: config.RaknetifyConfig{
+					Enabled: true,
+					Mode:    config.RaknetifyModePassthrough,
+				},
+			},
+		},
+	}
+
+	warns, errs := cfg.Validate()
+	assert.Empty(t, warns, "Should have no warnings")
+	assert.Empty(t, errs, "Raknetify passthrough should allow proxyProtocol for TCP-only use")
+}
+
 func TestConfigValidation_ParameterWarnings(t *testing.T) {
 	tests := []struct {
 		name          string
