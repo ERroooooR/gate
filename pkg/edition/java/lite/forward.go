@@ -22,6 +22,7 @@ import (
 	"go.minekube.com/gate/pkg/edition/java/proto/state"
 	"go.minekube.com/gate/pkg/edition/java/proto/util"
 	"go.minekube.com/gate/pkg/gate/proto"
+	"go.minekube.com/gate/pkg/internal/tcpbrutal"
 	"go.minekube.com/gate/pkg/util/errs"
 	"go.minekube.com/gate/pkg/util/netutil"
 	"golang.org/x/sync/singleflight"
@@ -43,6 +44,7 @@ func Forward(
 	handshake *packet.Handshake,
 	pc *proto.PacketContext,
 	strategyManager *StrategyManager,
+	backendTCPBrutal tcpbrutal.Options,
 ) {
 	defer func() { _ = client.Close() }()
 
@@ -54,7 +56,7 @@ func Forward(
 
 	// Find a backend to dial successfully.
 	backendAddr, log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, net.Conn, error) {
-		conn, err := dialRoute(client.Context(), dialTimeout, src.RemoteAddr(), route, backendAddr, handshake, pc, false)
+		conn, err := dialRoute(client.Context(), dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, pc, false, backendTCPBrutal)
 		return log, conn, err
 	})
 	if err != nil {
@@ -82,7 +84,7 @@ func Forward(
 var errAllBackendsFailed = errors.New("all backends failed")
 
 // tryBackends tries backends until one succeeds or all fail.
-func tryBackends[T any](next nextBackendFunc, try func(log logr.Logger, backendAddr string) (logr.Logger, T, error)) (string, logr.Logger, T, error) {
+func tryBackends[T any](next NextBackendFunc, try func(log logr.Logger, backendAddr string) (logr.Logger, T, error)) (string, logr.Logger, T, error) {
 	for {
 		backendAddr, log, ok := next()
 		if !ok {
@@ -134,11 +136,11 @@ func pipe(log logr.Logger, src, dst net.Conn) {
 	}
 }
 
-type nextBackendFunc func() (backendAddr string, log logr.Logger, ok bool)
+type NextBackendFunc func() (backendAddr string, log logr.Logger, ok bool)
 
-// substituteBackendParams replaces $1, $2, etc. in the backend address template with captured groups.
+// SubstituteBackendParams replaces $1, $2, etc. in the backend address template with captured groups.
 // If a parameter index is out of range or missing, it leaves the parameter as-is (e.g., "$99" stays "$99").
-func substituteBackendParams(template string, groups []string) string {
+func SubstituteBackendParams(template string, groups []string) string {
 	if len(groups) == 0 {
 		return template
 	}
@@ -166,7 +168,7 @@ func findRoute(
 	newLog logr.Logger,
 	src net.Conn,
 	route *config.Route,
-	nextBackend nextBackendFunc,
+	nextBackend NextBackendFunc,
 	err error,
 ) {
 	srcConn, ok := netmc.Assert[interface{ Conn() net.Conn }](client)
@@ -206,7 +208,7 @@ func findRoute(
 
 		// Substitute parameters in backend address if groups were captured
 		if len(groups) > 0 {
-			backendAddr = substituteBackendParams(backendAddr, groups)
+			backendAddr = SubstituteBackendParams(backendAddr, groups)
 		}
 
 		// Remove selected backend from list to avoid retrying it
@@ -214,7 +216,7 @@ func findRoute(
 			// Apply parameter substitution to the original backend for comparison
 			originalBackend := backend
 			if len(groups) > 0 {
-				originalBackend = substituteBackendParams(backend, groups)
+				originalBackend = SubstituteBackendParams(backend, groups)
 			}
 
 			normalizedBackend, err := netutil.Parse(originalBackend, src.RemoteAddr().Network())
@@ -247,15 +249,33 @@ func findRoute(
 	return log, src, route, nextBackend, nil
 }
 
+func PrepareForwardingRoute(
+	routes []config.Route,
+	log logr.Logger,
+	client netmc.MinecraftConn,
+	handshake *packet.Handshake,
+	strategyManager *StrategyManager,
+) (
+	newLog logr.Logger,
+	src net.Conn,
+	route *config.Route,
+	nextBackend NextBackendFunc,
+	err error,
+) {
+	return findRoute(routes, log, client, handshake, strategyManager)
+}
+
 func dialRoute(
 	ctx context.Context,
 	dialTimeout time.Duration,
+	log logr.Logger,
 	srcAddr net.Addr,
 	route *config.Route,
 	backendAddr string,
 	handshake *packet.Handshake,
 	handshakeCtx *proto.PacketContext,
 	forceUpdatePacketContext bool,
+	backendTCPBrutal tcpbrutal.Options,
 ) (dst net.Conn, err error) {
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
@@ -283,6 +303,10 @@ func dialRoute(
 			_ = dstConn.Close()
 		}
 	}()
+	if err = tcpbrutal.Apply(dst, backendTCPBrutal); err != nil {
+		log.Info("failed to apply TCP Brutal to lite backend connection", "err", err, "backendAddr", backendAddr)
+		err = nil
+	}
 
 	if route.ProxyProtocol {
 		header := protoutil.ProxyHeader(srcAddr, dst.RemoteAddr())
@@ -346,6 +370,7 @@ func ResolveStatusResponse(
 	handshakeCtx *proto.PacketContext,
 	statusRequestCtx *proto.PacketContext,
 	strategyManager *StrategyManager,
+	backendTCPBrutal tcpbrutal.Options,
 ) (logr.Logger, *packet.StatusResponse, error) {
 	log, src, route, nextBackend, err := findRoute(routes, log, client, handshake, strategyManager)
 	if err != nil {
@@ -355,7 +380,7 @@ func ResolveStatusResponse(
 	_, log, res, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, *packet.StatusResponse, error) {
 		// Measure status response time for latency tracking (better than dial time)
 		start := time.Now()
-		newLog, response, respErr := resolveStatusResponse(src, dialTimeout, backendAddr, route, log, client, handshake, handshakeCtx, statusRequestCtx)
+		newLog, response, respErr := resolveStatusResponse(src, dialTimeout, backendAddr, route, log, client, handshake, handshakeCtx, statusRequestCtx, backendTCPBrutal)
 		statusLatency := time.Since(start)
 
 		// Record latency for lowest-latency strategy (only on success)
@@ -443,6 +468,7 @@ func resolveStatusResponse(
 	handshake *packet.Handshake,
 	handshakeCtx *proto.PacketContext,
 	statusRequestCtx *proto.PacketContext,
+	backendTCPBrutal tcpbrutal.Options,
 ) (logr.Logger, *packet.StatusResponse, error) {
 	key := pingKey{backendAddr, proto.Protocol(handshake.ProtocolVersion)}
 
@@ -468,7 +494,7 @@ func resolveStatusResponse(
 		log.V(1).Info("resolving status")
 
 		ctx = logr.NewContext(ctx, log)
-		dst, err := dialRoute(ctx, dialTimeout, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, route.CachePingEnabled())
+		dst, err := dialRoute(ctx, dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, route.CachePingEnabled(), backendTCPBrutal)
 		if err != nil {
 			return nil, fmt.Errorf("failed to dial route: %w", err)
 		}

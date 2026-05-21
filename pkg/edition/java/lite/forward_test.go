@@ -219,7 +219,7 @@ func Test_substituteBackendParams(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := substituteBackendParams(tt.template, tt.groups)
+			got := SubstituteBackendParams(tt.template, tt.groups)
 			if got != tt.want {
 				t.Errorf("substituteBackendParams(%q, %v) = %q, want %q", tt.template, tt.groups, got, tt.want)
 			}

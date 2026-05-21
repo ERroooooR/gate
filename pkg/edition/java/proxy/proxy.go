@@ -33,6 +33,7 @@ import (
 	"go.minekube.com/gate/pkg/internal/addrquota"
 	"go.minekube.com/gate/pkg/internal/connwrap"
 	"go.minekube.com/gate/pkg/internal/reload"
+	"go.minekube.com/gate/pkg/internal/tcpbrutal"
 	"go.minekube.com/gate/pkg/util/errs"
 	"go.minekube.com/gate/pkg/util/netutil"
 	"go.minekube.com/gate/pkg/util/uuid"
@@ -190,6 +191,9 @@ func (p *Proxy) Start(ctx context.Context) error {
 		}
 		if p.cfg.Auth.SessionServerURL != nil {
 			p.log.Info("using custom authentication server", "url", p.cfg.Auth.SessionServerURL)
+		}
+		if p.cfg.TCPBrutal.Enabled {
+			p.log.Info("tcpBrutal enabled", "downMbps", p.cfg.TCPBrutal.DownMbps, "upMbps", p.cfg.TCPBrutal.UpMbps, "cwndGain", p.cfg.TCPBrutal.EffectiveCwndGain())
 		}
 	}
 	logInfo()
@@ -571,6 +575,9 @@ func (p *Proxy) listenAndServe(ctx context.Context, addr string) error {
 				return nil
 			}
 			return fmt.Errorf("error accepting new connection: %w", err)
+		}
+		if err := tcpbrutal.Apply(conn, p.cfg.TCPBrutal.ClientOptions()); err != nil {
+			p.log.Info("failed to apply tcpBrutal to client connection", "err", err, "remoteAddr", conn.RemoteAddr())
 		}
 
 		if p.cfg.ProxyProtocol {

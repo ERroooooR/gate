@@ -92,6 +92,14 @@ config:
   # Proxy protocol (HA-Proxy) determines whether Gate should support proxy protocol for players.
   # Do not enable this if you don't know what it is.
   proxyProtocol: false
+  # TCP Brutal applies Linux TCP Brutal congestion control to Gate-owned TCP sockets.
+  # It only works on Linux with the tcp-brutal kernel module loaded.
+  # downMbps controls Gate -> player connections; upMbps controls Gate -> backend connections.
+  # tcpBrutal:
+  #   enabled: false
+  #   downMbps: 100
+  #   upMbps: 20
+  #   cwndGain: 15
   # The quota settings allows rate-limiting IP (last block cut off) for certain operations.
   # ops: The allowed operations per second.
   # burst: The maximum operations per second (queue like). One burst unit per seconds is refilled.

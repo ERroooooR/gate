@@ -97,6 +97,14 @@ config:
   # Proxy protocol (HA-Proxy) determines whether Gate should support proxy protocol for players.
   # Do not enable this if you don't know what it is.
   proxyProtocol: false
+  # TCP Brutal applies Linux TCP Brutal congestion control to Gate-owned TCP sockets.
+  # It only works on Linux with the tcp-brutal kernel module loaded.
+  # downMbps controls Gate -> player connections; upMbps controls Gate -> backend connections.
+  # tcpBrutal:
+  #   enabled: false
+  #   downMbps: 100
+  #   upMbps: 20
+  #   cwndGain: 15
   # ForcedHosts routes players to specific servers based on the hostname they connect with.
   # This allows you to have multiple domains pointing to the same Gate proxy but route players
   # to different servers based on which domain they used to connect.

@@ -13,6 +13,7 @@ import (
 	"go.minekube.com/gate/pkg/edition/java/lite/config"
 	"go.minekube.com/gate/pkg/edition/java/proto/packet"
 	"go.minekube.com/gate/pkg/gate/proto"
+	"go.minekube.com/gate/pkg/internal/tcpbrutal"
 	"go.minekube.com/gate/pkg/util/errs"
 )
 
@@ -31,7 +32,7 @@ func TestDialRouteConnectionRefusedVerbosity(t *testing.T) {
 	handshakeCtx := &proto.PacketContext{}
 
 	// This should fail with connection refused
-	_, err := dialRoute(ctx, dialTimeout, srcAddr, route, backendAddr, handshake, handshakeCtx, false)
+	_, err := dialRoute(ctx, dialTimeout, logr.Discard(), srcAddr, route, backendAddr, handshake, handshakeCtx, false, tcpbrutal.Options{})
 
 	assert.Error(t, err, "Should fail to connect to closed port")
 
@@ -78,7 +79,7 @@ func TestTryBackendsRealFlow(t *testing.T) {
 		handshake := &packet.Handshake{}
 		handshakeCtx := &proto.PacketContext{}
 
-		conn, err := dialRoute(ctx, dialTimeout, srcAddr, route, backendAddr, handshake, handshakeCtx, false)
+		conn, err := dialRoute(ctx, dialTimeout, log, srcAddr, route, backendAddr, handshake, handshakeCtx, false, tcpbrutal.Options{})
 		return log, conn, err
 	}
 

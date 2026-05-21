@@ -33,6 +33,7 @@ import (
 	"go.minekube.com/gate/pkg/edition/java/proto/packet/plugin"
 	"go.minekube.com/gate/pkg/edition/java/proto/state"
 	"go.minekube.com/gate/pkg/edition/java/proxy/message"
+	"go.minekube.com/gate/pkg/internal/tcpbrutal"
 	"go.minekube.com/gate/pkg/util/netutil"
 	"go.minekube.com/gate/pkg/util/uuid"
 )
@@ -328,23 +329,30 @@ func (s *serverConnection) dial(ctx context.Context) (net.Conn, error) {
 	defer span.End()
 
 	var (
-		sd ServerDialer
-		ok bool
+		conn net.Conn
+		err  error
+		sd   ServerDialer
+		ok   bool
 	)
 	if sd, ok = s.Server().ServerInfo().(ServerDialer); !ok {
 		if sd, ok = s.Server().(ServerDialer); !ok {
 			dstAddr := s.Server().ServerInfo().Addr()
 			span.SetAttributes(attribute.Stringer("server.addr", dstAddr))
 			var d net.Dialer
-			conn, err := d.DialContext(ctx, "tcp", dstAddr.String())
-			if err != nil {
-				return nil, err
-			}
-
-			return conn, nil
+			conn, err = d.DialContext(ctx, "tcp", dstAddr.String())
+		} else {
+			conn, err = sd.Dial(ctx, s.player)
 		}
+	} else {
+		conn, err = sd.Dial(ctx, s.player)
 	}
-	return sd.Dial(ctx, s.player)
+	if err != nil {
+		return nil, err
+	}
+	if err := tcpbrutal.Apply(conn, s.config().TCPBrutal.BackendOptions()); err != nil {
+		s.log.Info("failed to apply tcpBrutal to backend connection", "err", err)
+	}
+	return conn, nil
 }
 
 // HandshakeAddresser provides the ServerAddress sent with the packet.Handshake when a player joins the server

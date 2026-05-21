@@ -3,6 +3,7 @@ package config
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
@@ -161,4 +162,43 @@ bedrock:
 	if bedrockConfig.GeyserListenAddr != bconfig.DefaultConfig.GeyserListenAddr {
 		t.Errorf("Expected default GeyserListenAddr to be applied")
 	}
+}
+
+func TestTCPBrutalConfig(t *testing.T) {
+	yamlConfig := `
+tcpBrutal:
+  enabled: true
+  downMbps: 100
+  upMbps: 20
+  cwndGain: 20
+`
+
+	var cfg Config
+	require.NoError(t, yaml.Unmarshal([]byte(yamlConfig), &cfg))
+
+	require.True(t, cfg.TCPBrutal.Enabled)
+	require.Equal(t, uint64(100), cfg.TCPBrutal.DownMbps)
+	require.Equal(t, uint64(20), cfg.TCPBrutal.UpMbps)
+	require.Equal(t, uint32(20), cfg.TCPBrutal.CwndGain)
+
+	clientOptions := cfg.TCPBrutal.ClientOptions()
+	require.True(t, clientOptions.Enabled)
+	require.Equal(t, uint64(12_500_000), clientOptions.RateBytesPerSecond)
+	require.Equal(t, uint32(20), clientOptions.CwndGain)
+
+	backendOptions := cfg.TCPBrutal.BackendOptions()
+	require.True(t, backendOptions.Enabled)
+	require.Equal(t, uint64(2_500_000), backendOptions.RateBytesPerSecond)
+	require.Equal(t, uint32(20), backendOptions.CwndGain)
+}
+
+func TestTCPBrutalDefaultCwndGainAndNoopWarning(t *testing.T) {
+	cfg := DefaultConfig
+	cfg.TCPBrutal.Enabled = true
+
+	warns, errs := cfg.Validate()
+	require.Empty(t, errs)
+	require.NotEmpty(t, warns)
+	assert.Contains(t, warns[0].Error(), "TCP Brutal is enabled")
+	require.Equal(t, uint32(15), cfg.TCPBrutal.EffectiveCwndGain())
 }

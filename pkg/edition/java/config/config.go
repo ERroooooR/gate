@@ -8,6 +8,7 @@ import (
 	bconfig "go.minekube.com/gate/pkg/edition/bedrock/config"
 	liteconfig "go.minekube.com/gate/pkg/edition/java/lite/config"
 	"go.minekube.com/gate/pkg/edition/java/proto/version"
+	"go.minekube.com/gate/pkg/internal/tcpbrutal"
 	"go.minekube.com/gate/pkg/util/componentutil"
 	"go.minekube.com/gate/pkg/util/configutil"
 	"go.minekube.com/gate/pkg/util/favicon"
@@ -63,6 +64,7 @@ var DefaultConfig = Config{
 	},
 	ProxyProtocol:                       false,
 	ProxyProtocolBackend:                false,
+	TCPBrutal:                           TCPBrutal{},
 	ShouldPreventClientProxyConnections: false,
 	BungeePluginChannelEnabled:          true,
 	BuiltinCommands:                     true,
@@ -109,6 +111,7 @@ type Config struct { // TODO use https://github.com/projectdiscovery/yamldoc-go 
 	Compression          Compression `yaml:"compression,omitempty" json:"compression,omitempty"`
 	ProxyProtocol        bool        `yaml:"proxyProtocol,omitempty" json:"proxyProtocol,omitempty"`     // Enable HA-Proxy protocol mode
 	ProxyProtocolBackend bool        `yaml:"proxyProtocolBackend" json:"proxyProtocolBackend,omitempty"` // Enable HA-Proxy protocol mode for backend servers
+	TCPBrutal            TCPBrutal   `yaml:"tcpBrutal,omitempty" json:"tcpBrutal,omitempty"`             // TCP Brutal congestion control settings
 
 	ShouldPreventClientProxyConnections bool `yaml:"shouldPreventClientProxyConnections" json:"shouldPreventClientProxyConnections,omitempty"` // Sends player IP to Mojang on login
 
@@ -150,6 +153,12 @@ type (
 		Threshold int `yaml:"threshold"`
 		Level     int `yaml:"level"`
 	}
+	TCPBrutal struct {
+		Enabled  bool   `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+		DownMbps uint64 `yaml:"downMbps,omitempty" json:"downMbps,omitempty"`
+		UpMbps   uint64 `yaml:"upMbps,omitempty" json:"upMbps,omitempty"`
+		CwndGain uint32 `yaml:"cwndGain,omitempty" json:"cwndGain,omitempty"`
+	}
 	// Quota is the config for rate limiting.
 	Quota struct {
 		Connections QuotaSettings `yaml:"connections"` // Limits new connections per second, per IP block.
@@ -169,6 +178,29 @@ type (
 		SessionServerURL *configutil.URL `yaml:"sessionServerUrl"` // TODO support multiple urls configutil.SingleOrMulti[URL]
 	}
 )
+
+func (t TCPBrutal) EffectiveCwndGain() uint32 {
+	if t.CwndGain == 0 {
+		return tcpbrutal.DefaultCwndGain
+	}
+	return t.CwndGain
+}
+
+func (t TCPBrutal) ClientOptions() tcpbrutal.Options {
+	return tcpbrutal.Options{
+		Enabled:            t.Enabled,
+		RateBytesPerSecond: tcpbrutal.MbpsToBytesPerSecond(t.DownMbps),
+		CwndGain:           t.EffectiveCwndGain(),
+	}
+}
+
+func (t TCPBrutal) BackendOptions() tcpbrutal.Options {
+	return tcpbrutal.Options{
+		Enabled:            t.Enabled,
+		RateBytesPerSecond: tcpbrutal.MbpsToBytesPerSecond(t.UpMbps),
+		CwndGain:           t.EffectiveCwndGain(),
+	}
+}
 
 // ForwardingMode is a player info forwarding mode.
 type ForwardingMode string
@@ -213,6 +245,9 @@ func (c *Config) Validate() (warns []error, errs []error) {
 				e("Invalid quota max entries %d, use a number >= 1", quota.Burst)
 			}
 		}
+	}
+	if c.TCPBrutal.Enabled && c.TCPBrutal.DownMbps == 0 && c.TCPBrutal.UpMbps == 0 {
+		w("TCP Brutal is enabled but both downMbps and upMbps are zero; no TCP sockets will be changed")
 	}
 
 	if c.Lite.Enabled {
