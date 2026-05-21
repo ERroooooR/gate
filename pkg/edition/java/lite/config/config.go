@@ -35,10 +35,15 @@ type (
 		Fallback      *Status                          `json:"fallback,omitempty" yaml:"fallback,omitempty"`         // nil = disabled
 		ProxyProtocol bool                             `json:"proxyProtocol,omitempty" yaml:"proxyProtocol,omitempty"`
 		// Deprecated: use TCPShieldRealIP instead.
-		RealIP            bool     `json:"realIP,omitempty" yaml:"realIP,omitempty"`
-		TCPShieldRealIP   bool     `json:"tcpShieldRealIP,omitempty" yaml:"tcpShieldRealIP,omitempty"`
-		ModifyVirtualHost bool     `json:"modifyVirtualHost,omitempty" yaml:"modifyVirtualHost,omitempty"`
-		Strategy          Strategy `json:"strategy,omitempty" yaml:"strategy,omitempty"`
+		RealIP            bool            `json:"realIP,omitempty" yaml:"realIP,omitempty"`
+		TCPShieldRealIP   bool            `json:"tcpShieldRealIP,omitempty" yaml:"tcpShieldRealIP,omitempty"`
+		ModifyVirtualHost bool            `json:"modifyVirtualHost,omitempty" yaml:"modifyVirtualHost,omitempty"`
+		Strategy          Strategy        `json:"strategy,omitempty" yaml:"strategy,omitempty"`
+		Raknetify         RaknetifyConfig `json:"raknetify,omitempty" yaml:"raknetify,omitempty"`
+	}
+	RaknetifyConfig struct {
+		Enabled bool          `json:"enabled,omitempty" yaml:"enabled,omitempty"`
+		Mode    RaknetifyMode `json:"mode,omitempty" yaml:"mode,omitempty"`
 	}
 	Status struct {
 		MOTD    *configutil.TextComponent `yaml:"motd,omitempty" json:"motd,omitempty"`
@@ -47,6 +52,13 @@ type (
 		Favicon favicon.Favicon           `yaml:"favicon,omitempty" json:"favicon,omitempty"`
 		ModInfo modinfo.ModInfo           `yaml:"modInfo,omitempty" json:"modInfo,omitempty"`
 	}
+)
+
+type RaknetifyMode string
+
+const (
+	RaknetifyModeTranslate   RaknetifyMode = "translate"
+	RaknetifyModePassthrough RaknetifyMode = "passthrough"
 )
 
 // Response returns the configured status response.
@@ -74,6 +86,14 @@ func (r *Route) CachePingEnabled() bool { return r.GetCachePingTTL() > 0 }
 
 // GetTCPShieldRealIP returns the configured TCPShieldRealIP or deprecated RealIP value.
 func (r *Route) GetTCPShieldRealIP() bool { return r.TCPShieldRealIP || r.RealIP }
+
+// RaknetifyMode returns the configured Raknetify mode or the default translate mode.
+func (r *Route) RaknetifyMode() RaknetifyMode {
+	if r.Raknetify.Mode == "" {
+		return RaknetifyModeTranslate
+	}
+	return r.Raknetify.Mode
+}
 
 // Strategy represents a load balancing strategy for lite mode routes.
 type Strategy string
@@ -103,6 +123,11 @@ var allowedStrategies = []Strategy{
 	StrategyLowestLatency,
 }
 
+var allowedRaknetifyModes = []RaknetifyMode{
+	RaknetifyModeTranslate,
+	RaknetifyModePassthrough,
+}
+
 func (c Config) Validate() (warns []error, errs []error) {
 	e := func(m string, args ...any) { errs = append(errs, fmt.Errorf(m, args...)) }
 	w := func(m string, args ...any) { warns = append(warns, fmt.Errorf(m, args...)) }
@@ -121,6 +146,17 @@ func (c Config) Validate() (warns []error, errs []error) {
 		}
 		if !slices.Contains(allowedStrategies, ep.Strategy) && ep.Strategy != "" {
 			e("Route %d: invalid strategy '%s', allowed: %v", i, ep.Strategy, allowedStrategies)
+		}
+		if ep.Raknetify.Enabled {
+			if ep.Raknetify.Mode == "" {
+				ep.Raknetify.Mode = RaknetifyModeTranslate
+			}
+			if !slices.Contains(allowedRaknetifyModes, ep.Raknetify.Mode) {
+				e("Route %d: invalid raknetify mode '%s', allowed: %v", i, ep.Raknetify.Mode, allowedRaknetifyModes)
+			}
+			if ep.Raknetify.Mode == RaknetifyModePassthrough && ep.ProxyProtocol {
+				e("Route %d: raknetify passthrough mode cannot be combined with proxyProtocol", i)
+			}
 		}
 
 		// Validate parameter usage in backend addresses

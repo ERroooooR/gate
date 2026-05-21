@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"go.minekube.com/gate/pkg/edition/java/lite"
+	liteconfig "go.minekube.com/gate/pkg/edition/java/lite/config"
 	"go.minekube.com/gate/pkg/edition/java/proto/state"
 
 	"github.com/go-logr/logr"
@@ -213,6 +214,32 @@ func (p *Proxy) Start(ctx context.Context) error {
 	}
 
 	stopLn := listen(p.cfg.Bind)
+	listenRaknetify := func(addr string) context.CancelFunc {
+		lnCtx, stop := context.WithCancel(ctx)
+		eg.Go(func() error {
+			defer stop()
+			return lite.ServeRaknetify(lnCtx, lite.RaknetifyOptions{
+				Bind: addr,
+				Routes: func() []liteconfig.Route {
+					return p.config().Lite.Routes
+				},
+				DialTimeout:      time.Duration(p.config().ConnectionTimeout),
+				ReadTimeout:      time.Duration(p.config().ReadTimeout),
+				WriteTimeout:     time.Duration(p.config().ReadTimeout),
+				CompressionLevel: p.config().Compression.Level,
+				StrategyManager:  p.lite.StrategyManager(),
+				BackendTCPBrutal: func() tcpbrutal.Options {
+					return p.config().TCPBrutal.BackendOptions()
+				},
+				Logger: p.log,
+			})
+		})
+		return stop
+	}
+	var stopRaknetify context.CancelFunc
+	if p.cfg.Lite.Enabled && lite.HasRaknetifyRoutes(p.cfg.Lite.Routes) {
+		stopRaknetify = listenRaknetify(p.cfg.Bind)
+	}
 
 	// Listen for config reloads until we exit
 	defer reload.Subscribe(p.event, func(e *javaConfigUpdateEvent) {
@@ -222,6 +249,26 @@ func (p *Proxy) Start(ctx context.Context) error {
 			p.closeMu.Lock()
 			stopLn()
 			stopLn = listen(e.Config.Bind)
+			if stopRaknetify != nil {
+				stopRaknetify()
+				stopRaknetify = nil
+			}
+			if e.Config.Lite.Enabled && lite.HasRaknetifyRoutes(e.Config.Lite.Routes) {
+				stopRaknetify = listenRaknetify(e.Config.Bind)
+			}
+			p.closeMu.Unlock()
+		}
+		prevRaknetifyEnabled := e.PrevConfig.Lite.Enabled && lite.HasRaknetifyRoutes(e.PrevConfig.Lite.Routes)
+		nextRaknetifyEnabled := e.Config.Lite.Enabled && lite.HasRaknetifyRoutes(e.Config.Lite.Routes)
+		if e.PrevConfig.Bind == e.Config.Bind && prevRaknetifyEnabled != nextRaknetifyEnabled {
+			p.closeMu.Lock()
+			if stopRaknetify != nil {
+				stopRaknetify()
+				stopRaknetify = nil
+			}
+			if nextRaknetifyEnabled {
+				stopRaknetify = listenRaknetify(e.Config.Bind)
+			}
 			p.closeMu.Unlock()
 		}
 		if err := p.init(); err != nil {

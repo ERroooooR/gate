@@ -22,6 +22,7 @@ import (
 	"go.minekube.com/gate/pkg/edition/java/proto/state"
 	"go.minekube.com/gate/pkg/edition/java/proto/util"
 	"go.minekube.com/gate/pkg/gate/proto"
+	"go.minekube.com/gate/pkg/internal/raknetify/raknet"
 	"go.minekube.com/gate/pkg/internal/tcpbrutal"
 	"go.minekube.com/gate/pkg/util/errs"
 	"go.minekube.com/gate/pkg/util/netutil"
@@ -46,6 +47,34 @@ func Forward(
 	strategyManager *StrategyManager,
 	backendTCPBrutal tcpbrutal.Options,
 ) {
+	forwardWithDialer(dialTimeout, routes, log, client, handshake, pc, strategyManager, backendTCPBrutal, false)
+}
+
+// ForwardRaknetify forwards a Raknetify client connection to a matching Lite route.
+func ForwardRaknetify(
+	dialTimeout time.Duration,
+	routes []config.Route,
+	log logr.Logger,
+	client netmc.MinecraftConn,
+	handshake *packet.Handshake,
+	pc *proto.PacketContext,
+	strategyManager *StrategyManager,
+	backendTCPBrutal tcpbrutal.Options,
+) {
+	forwardWithDialer(dialTimeout, routes, log, client, handshake, pc, strategyManager, backendTCPBrutal, true)
+}
+
+func forwardWithDialer(
+	dialTimeout time.Duration,
+	routes []config.Route,
+	log logr.Logger,
+	client netmc.MinecraftConn,
+	handshake *packet.Handshake,
+	pc *proto.PacketContext,
+	strategyManager *StrategyManager,
+	backendTCPBrutal tcpbrutal.Options,
+	raknetifyClient bool,
+) {
 	defer func() { _ = client.Close() }()
 
 	log, src, route, nextBackend, err := findRoute(routes, log, client, handshake, strategyManager)
@@ -53,10 +82,18 @@ func Forward(
 		errs.V(log, err).Info("failed to find route", "error", err)
 		return
 	}
+	if raknetifyClient && !route.Raknetify.Enabled {
+		log.Info("rejecting Raknetify connection for route without Raknetify enabled")
+		return
+	}
+	if raknetifyClient && route.RaknetifyMode() == config.RaknetifyModePassthrough {
+		forwardRaknetifyPassthrough(dialTimeout, log, client, route, nextBackend, handshake, pc, backendTCPBrutal)
+		return
+	}
 
 	// Find a backend to dial successfully.
 	backendAddr, log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, net.Conn, error) {
-		conn, err := dialRoute(client.Context(), dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, pc, false, backendTCPBrutal)
+		conn, err := dialRouteForMode(client.Context(), dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, pc, false, backendTCPBrutal, raknetifyClient)
 		return log, conn, err
 	})
 	if err != nil {
@@ -78,6 +115,161 @@ func Forward(
 
 	log.Info("forwarding connection", "backendAddr", backendAddr)
 	pipe(log, src, dst)
+}
+
+func forwardRaknetifyPassthrough(
+	dialTimeout time.Duration,
+	log logr.Logger,
+	client netmc.MinecraftConn,
+	route *config.Route,
+	nextBackend NextBackendFunc,
+	handshake *packet.Handshake,
+	handshakeCtx *proto.PacketContext,
+	backendTCPBrutal tcpbrutal.Options,
+) {
+	srcConn, ok := netmc.Assert[interface{ FrameConn() raknetFrameConn }](client)
+	if !ok {
+		errs.V(log, errors.New("raknetify passthrough requires a frame-aware RakNet connection")).
+			Info("failed to forward Raknetify passthrough connection")
+		return
+	}
+	src := srcConn.FrameConn()
+
+	backendAddr, log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, raknetFrameConn, error) {
+		conn, err := dialRaknetifyRoute(client.Context(), dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, backendTCPBrutal)
+		return log, conn, err
+	})
+	if err != nil {
+		return
+	}
+	defer func() { _ = dst.Close() }()
+
+	log.Info("forwarding Raknetify frames", "backendAddr", backendAddr)
+	pipeRaknetifyFrames(log, src, dst)
+}
+
+func dialRouteForMode(
+	ctx context.Context,
+	dialTimeout time.Duration,
+	log logr.Logger,
+	srcAddr net.Addr,
+	route *config.Route,
+	backendAddr string,
+	handshake *packet.Handshake,
+	handshakeCtx *proto.PacketContext,
+	forceUpdatePacketContext bool,
+	backendTCPBrutal tcpbrutal.Options,
+	raknetifyClient bool,
+) (net.Conn, error) {
+	if !raknetifyClient || route.RaknetifyMode() != config.RaknetifyModePassthrough {
+		return dialRoute(ctx, dialTimeout, log, srcAddr, route, backendAddr, handshake, handshakeCtx, forceUpdatePacketContext, backendTCPBrutal)
+	}
+	if route.ProxyProtocol {
+		return nil, fmt.Errorf("raknetify passthrough mode cannot use proxyProtocol")
+	}
+
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	dst, err := dialRaknetify(dialCtx, backendAddr)
+	if err != nil {
+		v := 0
+		if dialCtx.Err() != nil {
+			v++
+		}
+		return nil, &errs.VerbosityError{
+			Verbosity: v,
+			Err:       fmt.Errorf("failed to connect to Raknetify backend %s: %w", backendAddr, err),
+		}
+	}
+	dstConn := dst
+	defer func() {
+		if err != nil {
+			_ = dstConn.Close()
+		}
+	}()
+
+	if route.ModifyVirtualHost {
+		clearedHost := ClearVirtualHost(handshake.ServerAddress)
+		backendHost := netutil.HostStr(backendAddr)
+		if !strings.EqualFold(clearedHost, backendHost) {
+			handshake.ServerAddress = strings.ReplaceAll(handshake.ServerAddress, clearedHost, backendHost)
+			forceUpdatePacketContext = true
+		}
+	}
+	if route.GetTCPShieldRealIP() && IsTCPShieldRealIP(handshake.ServerAddress) {
+		handshake.ServerAddress = TCPShieldRealIP(handshake.ServerAddress, srcAddr)
+		forceUpdatePacketContext = true
+	}
+	if forceUpdatePacketContext {
+		update(handshakeCtx, handshake)
+	}
+	if err = writePacket(dst, handshakeCtx); err != nil {
+		return dst, fmt.Errorf("failed to write handshake packet to Raknetify backend: %w", err)
+	}
+	return dst, nil
+}
+
+func dialRaknetifyRoute(
+	ctx context.Context,
+	dialTimeout time.Duration,
+	log logr.Logger,
+	srcAddr net.Addr,
+	route *config.Route,
+	backendAddr string,
+	handshake *packet.Handshake,
+	handshakeCtx *proto.PacketContext,
+	backendTCPBrutal tcpbrutal.Options,
+) (dst raknetFrameConn, err error) {
+	if route.ProxyProtocol {
+		return nil, fmt.Errorf("raknetify passthrough mode cannot use proxyProtocol")
+	}
+	if backendTCPBrutal.Enabled {
+		log.V(1).Info("TCP Brutal is ignored for Raknetify passthrough backends", "backendAddr", backendAddr)
+	}
+
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	dst, err = dialRaknetifyFrame(dialCtx, backendAddr)
+	if err != nil {
+		v := 0
+		if dialCtx.Err() != nil {
+			v++
+		}
+		return nil, &errs.VerbosityError{
+			Verbosity: v,
+			Err:       fmt.Errorf("failed to connect to Raknetify backend %s: %w", backendAddr, err),
+		}
+	}
+	defer func() {
+		if err != nil {
+			_ = dst.Close()
+		}
+	}()
+
+	if route.ModifyVirtualHost {
+		clearedHost := ClearVirtualHost(handshake.ServerAddress)
+		backendHost := netutil.HostStr(backendAddr)
+		if !strings.EqualFold(clearedHost, backendHost) {
+			handshake.ServerAddress = strings.ReplaceAll(handshake.ServerAddress, clearedHost, backendHost)
+			update(handshakeCtx, handshake)
+		}
+	}
+	if route.GetTCPShieldRealIP() && IsTCPShieldRealIP(handshake.ServerAddress) {
+		handshake.ServerAddress = TCPShieldRealIP(handshake.ServerAddress, srcAddr)
+		update(handshakeCtx, handshake)
+	}
+
+	payload := make([]byte, 1+len(handshakeCtx.Payload))
+	payload[0] = raknetifyGamePacketID
+	copy(payload[1:], handshakeCtx.Payload)
+	if _, err = dst.WriteFrame(&raknet.Frame{
+		Payload:      payload,
+		Reliability:  raknet.ReliabilityReliableOrdered,
+		OrderChannel: 0,
+	}); err != nil {
+		return dst, fmt.Errorf("failed to write handshake frame to Raknetify backend: %w", err)
+	}
+	return dst, nil
 }
 
 // errAllBackendsFailed is returned when all backends failed to dial.
@@ -134,6 +326,42 @@ func pipe(log logr.Logger, src, dst net.Conn) {
 	if log.Enabled() {
 		log.V(1).Info("done copying client -> backend", "bytes", i, "error", err)
 	}
+}
+
+func pipeRaknetifyFrames(log logr.Logger, src, dst raknetFrameConn) {
+	var zero time.Time
+	_ = src.SetDeadline(zero)
+	_ = dst.SetDeadline(zero)
+
+	copyFrames := func(name string, dst, src raknetFrameConn) {
+		var frames int64
+		var bytes int64
+		var err error
+		for {
+			var frame *raknet.Frame
+			frame, err = src.ReadFrame()
+			if err != nil {
+				break
+			}
+			bytes += int64(len(frame.Payload))
+			frames++
+			if len(frame.Payload) != 0 && frame.Payload[0] == raknetifySyncPacketID {
+				if syncer, ok := dst.(raknetSyncFrameConn); ok {
+					frame = syncer.RaknetifySyncFrame()
+				}
+			}
+			if _, err = dst.WriteFrame(frame); err != nil {
+				break
+			}
+		}
+		if log.Enabled() {
+			log.V(1).Info("done copying Raknetify frames "+name, "frames", frames, "bytes", bytes, "error", err)
+		}
+		_ = dst.Close()
+	}
+
+	go copyFrames("backend -> client", src, dst)
+	copyFrames("client -> backend", dst, src)
 }
 
 type NextBackendFunc func() (backendAddr string, log logr.Logger, ok bool)
@@ -372,15 +600,48 @@ func ResolveStatusResponse(
 	strategyManager *StrategyManager,
 	backendTCPBrutal tcpbrutal.Options,
 ) (logr.Logger, *packet.StatusResponse, error) {
+	return resolveStatusResponseForMode(dialTimeout, routes, log, client, handshake, handshakeCtx, statusRequestCtx, strategyManager, backendTCPBrutal, false)
+}
+
+// ResolveStatusResponseRaknetify resolves a status response for a Raknetify client connection.
+func ResolveStatusResponseRaknetify(
+	dialTimeout time.Duration,
+	routes []config.Route,
+	log logr.Logger,
+	client netmc.MinecraftConn,
+	handshake *packet.Handshake,
+	handshakeCtx *proto.PacketContext,
+	statusRequestCtx *proto.PacketContext,
+	strategyManager *StrategyManager,
+	backendTCPBrutal tcpbrutal.Options,
+) (logr.Logger, *packet.StatusResponse, error) {
+	return resolveStatusResponseForMode(dialTimeout, routes, log, client, handshake, handshakeCtx, statusRequestCtx, strategyManager, backendTCPBrutal, true)
+}
+
+func resolveStatusResponseForMode(
+	dialTimeout time.Duration,
+	routes []config.Route,
+	log logr.Logger,
+	client netmc.MinecraftConn,
+	handshake *packet.Handshake,
+	handshakeCtx *proto.PacketContext,
+	statusRequestCtx *proto.PacketContext,
+	strategyManager *StrategyManager,
+	backendTCPBrutal tcpbrutal.Options,
+	raknetifyClient bool,
+) (logr.Logger, *packet.StatusResponse, error) {
 	log, src, route, nextBackend, err := findRoute(routes, log, client, handshake, strategyManager)
 	if err != nil {
 		return log, nil, err
+	}
+	if raknetifyClient && !route.Raknetify.Enabled {
+		return log, nil, fmt.Errorf("raknetify is not enabled for route")
 	}
 
 	_, log, res, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, *packet.StatusResponse, error) {
 		// Measure status response time for latency tracking (better than dial time)
 		start := time.Now()
-		newLog, response, respErr := resolveStatusResponse(src, dialTimeout, backendAddr, route, log, client, handshake, handshakeCtx, statusRequestCtx, backendTCPBrutal)
+		newLog, response, respErr := resolveStatusResponse(src, dialTimeout, backendAddr, route, log, client, handshake, handshakeCtx, statusRequestCtx, backendTCPBrutal, raknetifyClient)
 		statusLatency := time.Since(start)
 
 		// Record latency for lowest-latency strategy (only on success)
@@ -469,6 +730,7 @@ func resolveStatusResponse(
 	handshakeCtx *proto.PacketContext,
 	statusRequestCtx *proto.PacketContext,
 	backendTCPBrutal tcpbrutal.Options,
+	raknetifyClient bool,
 ) (logr.Logger, *packet.StatusResponse, error) {
 	key := pingKey{backendAddr, proto.Protocol(handshake.ProtocolVersion)}
 
@@ -494,7 +756,7 @@ func resolveStatusResponse(
 		log.V(1).Info("resolving status")
 
 		ctx = logr.NewContext(ctx, log)
-		dst, err := dialRoute(ctx, dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, route.CachePingEnabled(), backendTCPBrutal)
+		dst, err := dialRouteForMode(ctx, dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, route.CachePingEnabled(), backendTCPBrutal, raknetifyClient)
 		if err != nil {
 			return nil, fmt.Errorf("failed to dial route: %w", err)
 		}
