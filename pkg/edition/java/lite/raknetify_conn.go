@@ -21,11 +21,6 @@ const (
 	raknetifyStreamingCompressionHandshakePacketID = byte(0xec)
 )
 
-type raknetPacketConn interface {
-	net.Conn
-	ReadPacket() ([]byte, error)
-}
-
 type raknetFrameConn interface {
 	net.Conn
 	ReadFrame() (*raknet.Frame, error)

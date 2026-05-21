@@ -55,6 +55,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          cache: true
+          go-version-file: go.mod
+
+      - name: Build gate binary
+        run: |
+          mkdir -p dist
+          go build -o dist/gate ./gate.go
+
+      - name: Upload gate binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-linux-amd64
+          path: dist/gate
+
       - name: Set up docker buildx
         uses: docker/setup-buildx-action@v3
 

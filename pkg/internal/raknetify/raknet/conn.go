@@ -278,15 +278,6 @@ func (conn *Conn) RaknetifySyncFrame() *Frame {
 	}
 }
 
-// write writes a buffer b over the RakNet connection. The amount of bytes
-// written n is always equal to the length of the bytes written if the write
-// was successful. If not, an error is returned and n is 0. Write may be called
-// simultaneously from multiple goroutines, but will write one by one. Unlike
-// Write, write will not lock.
-func (conn *Conn) write(b []byte) (n int, err error) {
-	return conn.writeFrame(&Frame{Payload: b, Reliability: ReliabilityReliableOrdered})
-}
-
 func (conn *Conn) writeFrame(frame *Frame) (n int, err error) {
 	if frame == nil {
 		return 0, nil
