@@ -57,8 +57,9 @@ type (
 type RaknetifyMode string
 
 const (
-	RaknetifyModeTranslate   RaknetifyMode = "translate"
-	RaknetifyModePassthrough RaknetifyMode = "passthrough"
+	RaknetifyModeTranslate      RaknetifyMode = "translate"
+	RaknetifyModePassthrough    RaknetifyMode = "passthrough"
+	RaknetifyModeRawPassthrough RaknetifyMode = "raw-passthrough"
 )
 
 // Response returns the configured status response.
@@ -126,6 +127,7 @@ var allowedStrategies = []Strategy{
 var allowedRaknetifyModes = []RaknetifyMode{
 	RaknetifyModeTranslate,
 	RaknetifyModePassthrough,
+	RaknetifyModeRawPassthrough,
 }
 
 func (c Config) Validate() (warns []error, errs []error) {
@@ -191,6 +193,22 @@ func (c Config) Validate() (warns []error, errs []error) {
 				}
 			}
 		}
+	}
+
+	hasRawRaknetify := false
+	hasFramedRaknetify := false
+	for _, ep := range c.Routes {
+		if !ep.Raknetify.Enabled {
+			continue
+		}
+		if ep.RaknetifyMode() == RaknetifyModeRawPassthrough {
+			hasRawRaknetify = true
+		} else {
+			hasFramedRaknetify = true
+		}
+	}
+	if hasRawRaknetify && hasFramedRaknetify {
+		e("raw-passthrough Raknetify routes cannot be mixed with translate or passthrough routes on the same bind address")
 	}
 
 	return

@@ -30,6 +30,8 @@ config:
         # Modes:
         # - translate: Raknetify client -> Gate RakNet -> vanilla TCP backend
         # - passthrough: Raknetify client -> Gate RakNet -> Raknetify/RakNet backend
+        # - raw-passthrough: Raknetify client -> Gate UDP passthrough -> Raknetify/RakNet backend
+        #   raw-passthrough clients must use the raknetg; or raknetgl; address prefix.
         raknetify:
           enabled: false
           mode: translate

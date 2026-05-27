@@ -218,7 +218,7 @@ func (p *Proxy) Start(ctx context.Context) error {
 		lnCtx, stop := context.WithCancel(ctx)
 		eg.Go(func() error {
 			defer stop()
-			return lite.ServeRaknetify(lnCtx, lite.RaknetifyOptions{
+			opts := lite.RaknetifyOptions{
 				Bind: addr,
 				Routes: func() []liteconfig.Route {
 					return p.config().Lite.Routes
@@ -232,12 +232,25 @@ func (p *Proxy) Start(ctx context.Context) error {
 					return p.config().TCPBrutal.BackendOptions()
 				},
 				Logger: p.log,
-			})
+			}
+			if lite.HasRawRaknetifyRoutes(p.config().Lite.Routes) {
+				return lite.ServeRaknetifyRaw(lnCtx, opts)
+			}
+			return lite.ServeRaknetify(lnCtx, opts)
 		})
 		return stop
 	}
+	raknetifyMode := func(c *config.Config) string {
+		if !c.Lite.Enabled || !lite.HasRaknetifyRoutes(c.Lite.Routes) {
+			return ""
+		}
+		if lite.HasRawRaknetifyRoutes(c.Lite.Routes) {
+			return "raw"
+		}
+		return "framed"
+	}
 	var stopRaknetify context.CancelFunc
-	if p.cfg.Lite.Enabled && lite.HasRaknetifyRoutes(p.cfg.Lite.Routes) {
+	if raknetifyMode(p.cfg) != "" {
 		stopRaknetify = listenRaknetify(p.cfg.Bind)
 	}
 
@@ -253,20 +266,20 @@ func (p *Proxy) Start(ctx context.Context) error {
 				stopRaknetify()
 				stopRaknetify = nil
 			}
-			if e.Config.Lite.Enabled && lite.HasRaknetifyRoutes(e.Config.Lite.Routes) {
+			if raknetifyMode(e.Config) != "" {
 				stopRaknetify = listenRaknetify(e.Config.Bind)
 			}
 			p.closeMu.Unlock()
 		}
-		prevRaknetifyEnabled := e.PrevConfig.Lite.Enabled && lite.HasRaknetifyRoutes(e.PrevConfig.Lite.Routes)
-		nextRaknetifyEnabled := e.Config.Lite.Enabled && lite.HasRaknetifyRoutes(e.Config.Lite.Routes)
-		if e.PrevConfig.Bind == e.Config.Bind && prevRaknetifyEnabled != nextRaknetifyEnabled {
+		prevRaknetifyMode := raknetifyMode(e.PrevConfig)
+		nextRaknetifyMode := raknetifyMode(e.Config)
+		if e.PrevConfig.Bind == e.Config.Bind && prevRaknetifyMode != nextRaknetifyMode {
 			p.closeMu.Lock()
 			if stopRaknetify != nil {
 				stopRaknetify()
 				stopRaknetify = nil
 			}
-			if nextRaknetifyEnabled {
+			if nextRaknetifyMode != "" {
 				stopRaknetify = listenRaknetify(e.Config.Bind)
 			}
 			p.closeMu.Unlock()

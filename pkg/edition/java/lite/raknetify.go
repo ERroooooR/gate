@@ -42,6 +42,26 @@ func HasRaknetifyRoutes(routes []config.Route) bool {
 	return false
 }
 
+// HasRawRaknetifyRoutes reports whether any Lite route uses raw Raknetify UDP passthrough.
+func HasRawRaknetifyRoutes(routes []config.Route) bool {
+	for _, route := range routes {
+		if route.Raknetify.Enabled && route.RaknetifyMode() == config.RaknetifyModeRawPassthrough {
+			return true
+		}
+	}
+	return false
+}
+
+// HasFramedRaknetifyRoutes reports whether any Lite route needs Gate to terminate RakNet frames.
+func HasFramedRaknetifyRoutes(routes []config.Route) bool {
+	for _, route := range routes {
+		if route.Raknetify.Enabled && route.RaknetifyMode() != config.RaknetifyModeRawPassthrough {
+			return true
+		}
+	}
+	return false
+}
+
 // ServeRaknetify starts a RakNet listener for Gate Lite Raknetify clients.
 func ServeRaknetify(ctx context.Context, opts RaknetifyOptions) error {
 	if opts.Routes == nil {
