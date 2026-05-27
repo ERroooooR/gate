@@ -24,6 +24,7 @@ const (
 	raknetifyRetryDelay           = time.Millisecond * 50
 	raknetifyDefaultPendingFrames = 4
 	ackFlushThreshold             = raknetifyDefaultPendingFrames - 1
+	receiveQueueSize              = 512
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -44,6 +45,7 @@ type Conn struct {
 	once              sync.Once
 	closed, connected chan struct{}
 	close             func()
+	receiveQueue      chan []byte
 
 	mu  sync.Mutex
 	buf *bytes.Buffer
@@ -133,6 +135,46 @@ func newConnWithLimits(conn net.PacketConn, addr net.Addr, mtuSize uint16, limit
 	return c
 }
 
+// startQueuedReceiver makes inbound datagrams for this Conn get processed on a
+// per-connection goroutine. Listener-side connections use this so one slow
+// connection cannot block the shared UDP listener read loop.
+func (conn *Conn) startQueuedReceiver() {
+	conn.receiveQueue = make(chan []byte, receiveQueueSize)
+	go func() {
+		for {
+			select {
+			case b := <-conn.receiveQueue:
+				err := conn.receive(bytes.NewBuffer(b))
+				releaseQueuedDatagram(b)
+				if err != nil {
+					conn.closeImmediately()
+				}
+			case <-conn.closed:
+				return
+			}
+		}
+	}()
+}
+
+func (conn *Conn) receiveOrQueue(b *bytes.Buffer) error {
+	if conn.receiveQueue == nil {
+		return conn.receive(b)
+	}
+
+	datagram := copyQueuedDatagram(b.Bytes())
+	select {
+	case conn.receiveQueue <- datagram:
+		return nil
+	case <-conn.closed:
+		releaseQueuedDatagram(datagram)
+		return nil
+	default:
+		releaseQueuedDatagram(datagram)
+		conn.closeImmediately()
+		return fmt.Errorf("connection receive queue is full")
+	}
+}
+
 // startTicking makes the connection start ticking, sending ACKs and pings to
 // the other end where necessary and checking if the connection should be timed
 // out.
@@ -156,7 +198,8 @@ func (conn *Conn) startTicking() {
 			conn.checkResend(t)
 			if i%10 == 0 {
 				conn.mu.Lock()
-				if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt()*2 {
+				inactive := t.Sub(*conn.lastActivity.Load())
+				if inactive > time.Second*5 && inactive > time.Second*5+conn.retransmission.rtt()*2 {
 					// No activity for too long: Start timeout.
 					_ = conn.Close()
 				}
@@ -204,6 +247,10 @@ func (conn *Conn) flushACKs() {
 func (conn *Conn) checkResend(now time.Time) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
+
+	if len(conn.retransmission.unacknowledged) == 0 {
+		return
+	}
 
 	var (
 		resend []uint24
@@ -491,6 +538,28 @@ var packetPool = sync.Pool{
 	New: func() interface{} {
 		return &packet{reliability: reliabilityReliableOrdered}
 	},
+}
+
+var queuedDatagramPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, maxMTUSize)
+	},
+}
+
+func copyQueuedDatagram(src []byte) []byte {
+	buf := queuedDatagramPool.Get().([]byte)
+	if cap(buf) < len(src) {
+		buf = make([]byte, len(src))
+	}
+	buf = buf[:len(src)]
+	copy(buf, src)
+	return buf
+}
+
+func releaseQueuedDatagram(buf []byte) {
+	if cap(buf) == maxMTUSize {
+		queuedDatagramPool.Put(buf[:maxMTUSize])
+	}
 }
 
 const (

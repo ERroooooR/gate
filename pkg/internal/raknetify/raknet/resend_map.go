@@ -9,6 +9,8 @@ import (
 type resendMap struct {
 	unacknowledged map[uint24]resendRecord
 	delays         map[time.Time]time.Duration
+	cachedRTT      time.Duration
+	cachedRTTAt    time.Time
 }
 
 // resendRecord represents a single packet with a timestamp from when it was
@@ -62,9 +64,14 @@ func (m *resendMap) remove(index uint24, mul int) (*packet, bool) {
 // the last delayRecordCount values add in.
 func (m *resendMap) rtt() time.Duration {
 	const averageDuration = time.Second * 5
+	const cacheDuration = time.Millisecond * 250
+	now := time.Now()
+	if m.cachedRTT != 0 && now.Sub(m.cachedRTTAt) < cacheDuration {
+		return m.cachedRTT
+	}
+
 	var (
 		total, records time.Duration
-		now            = time.Now()
 	)
 	for t, rtt := range m.delays {
 		if now.Sub(t) > averageDuration {
@@ -76,7 +83,10 @@ func (m *resendMap) rtt() time.Duration {
 	}
 	if records == 0 {
 		// No records yet, generally should not happen. Just return a reasonable amount of time.
-		return time.Millisecond * 50
+		m.cachedRTT = time.Millisecond * 50
+	} else {
+		m.cachedRTT = total / records
 	}
-	return total / records
+	m.cachedRTTAt = now
+	return m.cachedRTT
 }

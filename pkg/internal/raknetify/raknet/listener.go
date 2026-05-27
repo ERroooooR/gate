@@ -212,7 +212,7 @@ func (listener *Listener) handle(b *bytes.Buffer, addr net.Addr) error {
 		// Connection was closed already.
 		return nil
 	default:
-		err := conn.receive(b)
+		err := conn.receiveOrQueue(b)
 		if err != nil {
 			conn.closeImmediately()
 		}
@@ -240,6 +240,7 @@ func (listener *Listener) handleOpenConnectionRequest2(b *bytes.Buffer, addr net
 	}
 
 	conn := newConn(listener.conn, addr, packet.ClientPreferredMTUSize)
+	conn.startQueuedReceiver()
 	conn.close = func() {
 		// Make sure to remove the connection from the Listener once the Conn is
 		// closed.
