@@ -542,12 +542,14 @@ var packetPool = sync.Pool{
 
 var queuedDatagramPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, maxMTUSize)
+		buf := make([]byte, maxMTUSize)
+		return &buf
 	},
 }
 
 func copyQueuedDatagram(src []byte) []byte {
-	buf := queuedDatagramPool.Get().([]byte)
+	bufPtr := queuedDatagramPool.Get().(*[]byte)
+	buf := *bufPtr
 	if cap(buf) < len(src) {
 		buf = make([]byte, len(src))
 	}
@@ -558,7 +560,8 @@ func copyQueuedDatagram(src []byte) []byte {
 
 func releaseQueuedDatagram(buf []byte) {
 	if cap(buf) == maxMTUSize {
-		queuedDatagramPool.Put(buf[:maxMTUSize])
+		buf = buf[:maxMTUSize]
+		queuedDatagramPool.Put(&buf)
 	}
 }
 
