@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -396,16 +397,24 @@ func pipe(log logr.Logger, src, dst net.Conn) {
 	_ = src.SetDeadline(zero)
 	_ = dst.SetDeadline(zero)
 
+	var closeOnce sync.Once
+	closeBoth := func() {
+		_ = src.Close()
+		_ = dst.Close()
+	}
+
 	go func() {
 		i, err := io.Copy(src, dst)
 		if log.Enabled() {
 			log.V(1).Info("done copying backend -> client", "bytes", i, "error", err)
 		}
+		closeOnce.Do(closeBoth)
 	}()
 	i, err := io.Copy(dst, src)
 	if log.Enabled() {
 		log.V(1).Info("done copying client -> backend", "bytes", i, "error", err)
 	}
+	closeOnce.Do(closeBoth)
 }
 
 func pipeRaknetifyFrames(log logr.Logger, src, dst raknetFrameConn) {
