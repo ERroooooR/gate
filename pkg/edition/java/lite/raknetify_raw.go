@@ -15,6 +15,8 @@ import (
 	"github.com/go-logr/logr"
 	"go.minekube.com/gate/pkg/edition/java/lite/config"
 	"go.minekube.com/gate/pkg/util/netutil"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 const (
@@ -27,6 +29,7 @@ const (
 	rawRaknetifySweepInterval     = 15 * time.Second
 	rawRaknetifyMaxSessions       = 4096
 	rawRaknetifySocketBufferSize  = 4 * 1024 * 1024
+	rawRaknetifyDefaultIPTOS      = 0x18
 )
 
 var rawRaknetifyRouteHintMagic = []byte("GATE_RAKNET_ROUTE")
@@ -209,11 +212,21 @@ func (s *rawRaknetifySession) sameRouteHint(hint rawRaknetifyRouteHint) bool {
 }
 
 func tuneRawRaknetifyUDPConn(log logr.Logger, name string, conn *net.UDPConn) {
+	setRawRaknetifyUDPQoS(log, name, conn, rawRaknetifyDefaultIPTOS)
 	if err := conn.SetReadBuffer(rawRaknetifySocketBufferSize); err != nil {
 		log.V(1).Info("failed to set raw raknetify UDP read buffer", "socket", name, "bytes", rawRaknetifySocketBufferSize, "error", err)
 	}
 	if err := conn.SetWriteBuffer(rawRaknetifySocketBufferSize); err != nil {
 		log.V(1).Info("failed to set raw raknetify UDP write buffer", "socket", name, "bytes", rawRaknetifySocketBufferSize, "error", err)
+	}
+}
+
+func setRawRaknetifyUDPQoS(log logr.Logger, name string, conn *net.UDPConn, tos int) {
+	if err := ipv4.NewPacketConn(conn).SetTOS(tos); err != nil {
+		log.V(1).Info("failed to set raw raknetify IPv4 TOS", "socket", name, "tos", tos, "error", err)
+	}
+	if err := ipv6.NewPacketConn(conn).SetTrafficClass(tos); err != nil {
+		log.V(1).Info("failed to set raw raknetify IPv6 traffic class", "socket", name, "trafficClass", tos, "error", err)
 	}
 }
 
