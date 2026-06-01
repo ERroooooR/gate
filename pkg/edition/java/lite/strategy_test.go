@@ -120,6 +120,54 @@ func TestConfigValidation_AllowsRaknetifyPassthroughWithProxyProtocol(t *testing
 	assert.Empty(t, errs, "Raknetify passthrough should allow proxyProtocol for TCP-only use")
 }
 
+func TestConfigValidation_RawRaknetifyQoS(t *testing.T) {
+	tos := 0
+	cfg := config.Config{
+		Routes: []config.Route{
+			{
+				Host:    []string{"test.com"},
+				Backend: []string{"server:25565"},
+				Raknetify: config.RaknetifyConfig{
+					Enabled: true,
+					Mode:    config.RaknetifyModeRawPassthrough,
+					RawPassthrough: config.RaknetifyRawPassthroughConfig{
+						QOS: config.RaknetifyQOSConfig{
+							Mode: config.RaknetifyQOSModeCustom,
+							TOS:  &tos,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	warns, errs := cfg.Validate()
+	assert.Empty(t, warns, "Should have no warnings")
+	assert.Empty(t, errs, "Custom raw Raknetify QoS TOS should be valid")
+}
+
+func TestConfigValidation_RawRaknetifyQoSRequiresCustomTOS(t *testing.T) {
+	cfg := config.Config{
+		Routes: []config.Route{
+			{
+				Host:    []string{"test.com"},
+				Backend: []string{"server:25565"},
+				Raknetify: config.RaknetifyConfig{
+					Enabled: true,
+					Mode:    config.RaknetifyModeRawPassthrough,
+					RawPassthrough: config.RaknetifyRawPassthroughConfig{
+						QOS: config.RaknetifyQOSConfig{Mode: config.RaknetifyQOSModeCustom},
+					},
+				},
+			},
+		},
+	}
+
+	_, errs := cfg.Validate()
+	assert.Len(t, errs, 1, "Should reject custom QoS without tos")
+	assert.Contains(t, errs[0].Error(), "requires tos")
+}
+
 func TestConfigValidation_ParameterWarnings(t *testing.T) {
 	tests := []struct {
 		name          string

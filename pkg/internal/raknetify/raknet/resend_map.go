@@ -42,7 +42,7 @@ func (m *resendMap) acknowledge(index uint24) (*packet, bool) {
 // retransmit looks up a packet with an index from the resendMap so that it may
 // be resent.
 func (m *resendMap) retransmit(index uint24) (*packet, bool) {
-	return m.remove(index, 2)
+	return m.remove(index, 1)
 }
 
 // remove deletes an index from the resendMap and adds the time since the

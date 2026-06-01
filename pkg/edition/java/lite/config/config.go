@@ -42,8 +42,20 @@ type (
 		Raknetify         RaknetifyConfig `json:"raknetify,omitempty" yaml:"raknetify,omitempty"`
 	}
 	RaknetifyConfig struct {
-		Enabled bool          `json:"enabled,omitempty" yaml:"enabled,omitempty"`
-		Mode    RaknetifyMode `json:"mode,omitempty" yaml:"mode,omitempty"`
+		Enabled        bool                          `json:"enabled,omitempty" yaml:"enabled,omitempty"`
+		Mode           RaknetifyMode                 `json:"mode,omitempty" yaml:"mode,omitempty"`
+		RawPassthrough RaknetifyRawPassthroughConfig `json:"rawPassthrough,omitempty" yaml:"rawPassthrough,omitempty"`
+	}
+	RaknetifyRawPassthroughConfig struct {
+		QOS            RaknetifyQOSConfig  `json:"qos,omitempty" yaml:"qos,omitempty"`
+		IdleTimeout    configutil.Duration `json:"idleTimeout,omitempty" yaml:"idleTimeout,omitempty"`
+		WriteTimeout   configutil.Duration `json:"writeTimeout,omitempty" yaml:"writeTimeout,omitempty"`
+		PacingInterval configutil.Duration `json:"pacingInterval,omitempty" yaml:"pacingInterval,omitempty"`
+		QueueSize      int                 `json:"queueSize,omitempty" yaml:"queueSize,omitempty"`
+	}
+	RaknetifyQOSConfig struct {
+		Mode RaknetifyQOSMode `json:"mode,omitempty" yaml:"mode,omitempty"`
+		TOS  *int             `json:"tos,omitempty" yaml:"tos,omitempty"`
 	}
 	Status struct {
 		MOTD    *configutil.TextComponent `yaml:"motd,omitempty" json:"motd,omitempty"`
@@ -55,11 +67,16 @@ type (
 )
 
 type RaknetifyMode string
+type RaknetifyQOSMode string
 
 const (
 	RaknetifyModeTranslate      RaknetifyMode = "translate"
 	RaknetifyModePassthrough    RaknetifyMode = "passthrough"
 	RaknetifyModeRawPassthrough RaknetifyMode = "raw-passthrough"
+
+	RaknetifyQOSModeDefault RaknetifyQOSMode = "default"
+	RaknetifyQOSModeClear   RaknetifyQOSMode = "clear"
+	RaknetifyQOSModeCustom  RaknetifyQOSMode = "custom"
 )
 
 // Response returns the configured status response.
@@ -130,6 +147,12 @@ var allowedRaknetifyModes = []RaknetifyMode{
 	RaknetifyModeRawPassthrough,
 }
 
+var allowedRaknetifyQOSModes = []RaknetifyQOSMode{
+	RaknetifyQOSModeDefault,
+	RaknetifyQOSModeClear,
+	RaknetifyQOSModeCustom,
+}
+
 func (c Config) Validate() (warns []error, errs []error) {
 	e := func(m string, args ...any) { errs = append(errs, fmt.Errorf(m, args...)) }
 	w := func(m string, args ...any) { warns = append(warns, fmt.Errorf(m, args...)) }
@@ -155,6 +178,31 @@ func (c Config) Validate() (warns []error, errs []error) {
 			}
 			if !slices.Contains(allowedRaknetifyModes, ep.Raknetify.Mode) {
 				e("Route %d: invalid raknetify mode '%s', allowed: %v", i, ep.Raknetify.Mode, allowedRaknetifyModes)
+			}
+			if ep.Raknetify.Mode == RaknetifyModeRawPassthrough {
+				qos := ep.Raknetify.RawPassthrough.QOS
+				if qos.Mode != "" && !slices.Contains(allowedRaknetifyQOSModes, qos.Mode) {
+					e("Route %d: invalid raknetify raw passthrough qos mode '%s', allowed: %v", i, qos.Mode, allowedRaknetifyQOSModes)
+				}
+				if qos.Mode == RaknetifyQOSModeCustom && qos.TOS == nil {
+					e("Route %d: raknetify raw passthrough qos mode 'custom' requires tos", i)
+				}
+				if qos.TOS != nil && (*qos.TOS < 0 || *qos.TOS > 255) {
+					e("Route %d: raknetify raw passthrough qos tos must be between 0 and 255", i)
+				}
+				raw := ep.Raknetify.RawPassthrough
+				if raw.IdleTimeout < 0 {
+					e("Route %d: raknetify raw passthrough idleTimeout must be >= 0", i)
+				}
+				if raw.WriteTimeout < 0 {
+					e("Route %d: raknetify raw passthrough writeTimeout must be >= 0", i)
+				}
+				if raw.PacingInterval < 0 {
+					e("Route %d: raknetify raw passthrough pacingInterval must be >= 0", i)
+				}
+				if raw.QueueSize < 0 {
+					e("Route %d: raknetify raw passthrough queueSize must be >= 0", i)
+				}
 			}
 		}
 

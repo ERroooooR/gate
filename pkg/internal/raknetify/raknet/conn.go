@@ -21,7 +21,9 @@ const (
 	maxMTUSize                    = 1400
 	maxWindowSize                 = 2048
 	tickInterval                  = time.Millisecond * 50
-	raknetifyRetryDelay           = time.Millisecond * 50
+	raknetifyRetryDelay           = time.Millisecond * 25
+	raknetifyKeepAliveInterval    = time.Millisecond * 500
+	raknetifyInactiveTimeout      = time.Second * 10
 	raknetifyDefaultPendingFrames = 4
 	ackFlushThreshold             = raknetifyDefaultPendingFrames - 1
 	receiveQueueSize              = 512
@@ -190,7 +192,7 @@ func (conn *Conn) startTicking() {
 		case t := <-ticker.C:
 			i++
 			conn.flushACKs()
-			if i%20 == 0 {
+			if time.Duration(i)*tickInterval%raknetifyKeepAliveInterval == 0 {
 				// We send a connected ping to calculate the rtt and let the
 				// other side know we haven't timed out.
 				conn.sendPing()
@@ -199,7 +201,7 @@ func (conn *Conn) startTicking() {
 			if i%10 == 0 {
 				conn.mu.Lock()
 				inactive := t.Sub(*conn.lastActivity.Load())
-				if inactive > time.Second*5 && inactive > time.Second*5+conn.retransmission.rtt()*2 {
+				if inactive > raknetifyInactiveTimeout && inactive > raknetifyInactiveTimeout+conn.retransmission.rtt()*2 {
 					// No activity for too long: Start timeout.
 					_ = conn.Close()
 				}
@@ -255,7 +257,7 @@ func (conn *Conn) checkResend(now time.Time) {
 	var (
 		resend []uint24
 		rtt    = conn.retransmission.rtt()
-		delay  = maxDuration(rtt+rtt/2, raknetifyRetryDelay)
+		delay  = maxDuration(rtt, raknetifyRetryDelay)
 	)
 	conn.rtt.Store(int64(rtt))
 
@@ -653,7 +655,7 @@ func (conn *Conn) receiveDatagram(b *bytes.Buffer) error {
 		// Datagram window couldn't be shifted up, so we're still missing
 		// packets.
 		rtt := time.Duration(conn.rtt.Load())
-		if missing := conn.win.missing(rtt + rtt/2); len(missing) > 0 {
+		if missing := conn.win.missing(maxDuration(rtt, raknetifyRetryDelay)); len(missing) > 0 {
 			if err = conn.sendNACK(missing); err != nil {
 				return fmt.Errorf("error sending NACK to request datagrams: %v", err)
 			}

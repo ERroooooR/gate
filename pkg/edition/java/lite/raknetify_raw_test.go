@@ -166,9 +166,51 @@ func TestRawRaknetifyV2HintTokenDeduplicatesRetries(t *testing.T) {
 	if replacement == first {
 		t.Fatal("new v2 route token reused the previous session")
 	}
-	srv.closeSession(clientAddr.String(), first, "test")
+	srv.closeSession(first, "test")
 	if loaded, ok := srv.loadSession(clientAddr); !ok || loaded != replacement {
 		t.Fatal("closing the old session removed the replacement session")
+	}
+}
+
+func TestRawRaknetifyV2HintMigratesClientAddress(t *testing.T) {
+	srv, clientAddr, cleanup := newRawRaknetifyTestServer(t)
+	defer cleanup()
+
+	token := string([]byte("0123456789abcdef"))
+	first, err := srv.ensureSession(clientAddr, rawRaknetifyRouteHint{
+		host:     "example.com",
+		token:    token,
+		hasToken: true,
+	})
+	if err != nil {
+		t.Fatalf("first ensureSession returned error: %v", err)
+	}
+	nextAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:45679")
+	if err != nil {
+		t.Fatalf("failed to resolve migrated client address: %v", err)
+	}
+	migrated, err := srv.ensureSession(nextAddr, rawRaknetifyRouteHint{
+		host:     "example.com",
+		token:    token,
+		hasToken: true,
+	})
+	if err != nil {
+		t.Fatalf("migrated ensureSession returned error: %v", err)
+	}
+	if migrated != first {
+		t.Fatal("v2 route token migration created a new session")
+	}
+	if srv.sessionCount.Load() != 1 {
+		t.Fatalf("unexpected session count: %d", srv.sessionCount.Load())
+	}
+	if _, ok := srv.loadSession(clientAddr); ok {
+		t.Fatal("old client address still resolves to migrated session")
+	}
+	if loaded, ok := srv.loadSession(nextAddr); !ok || loaded != first {
+		t.Fatal("new client address does not resolve to migrated session")
+	}
+	if current := first.currentClientAddr().String(); current != nextAddr.String() {
+		t.Fatalf("session client address = %s, want %s", current, nextAddr)
 	}
 }
 
