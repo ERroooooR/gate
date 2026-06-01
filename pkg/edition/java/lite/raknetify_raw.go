@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -30,6 +31,7 @@ const (
 	rawRaknetifyMaxSessions       = 4096
 	rawRaknetifySocketBufferSize  = 4 * 1024 * 1024
 	rawRaknetifyDefaultIPTOS      = 0x18
+	rawRaknetifyWriteTimeout      = 10 * time.Millisecond
 )
 
 var rawRaknetifyRouteHintMagic = []byte("GATE_RAKNET_ROUTE")
@@ -124,11 +126,13 @@ func (s *rawRaknetifyServer) serve(ctx context.Context) error {
 		packet := buf[:n]
 		if hint, ok, err := decodeRawRaknetifyRouteHint(packet); ok {
 			if err != nil {
+				rawRaknetifyMetrics.recordDroppedPacket("client_to_backend", "invalid_route_hint")
 				s.log.V(1).Info("dropping invalid raw raknetify route hint", "clientAddr", clientAddr, "error", err)
 				continue
 			}
 			hint.host = cleanRawRaknetifyHost(hint.host)
 			if _, err = s.ensureSession(clientAddr, hint); err != nil {
+				rawRaknetifyMetrics.recordSessionEvent("rejected", "ensure_failed")
 				s.log.Info("failed to create raw raknetify session", "clientAddr", clientAddr, "host", hint.host, "error", err)
 			}
 			continue
@@ -136,13 +140,21 @@ func (s *rawRaknetifyServer) serve(ctx context.Context) error {
 
 		session, ok := s.loadSession(clientAddr)
 		if !ok {
+			rawRaknetifyMetrics.recordDroppedPacket("client_to_backend", "no_route_hint")
 			s.log.V(1).Info("dropping raw raknetify packet without route hint", "clientAddr", clientAddr)
 			continue
 		}
 		session.touch(time.Now())
-		if _, err = session.backendConn.Write(packet); err != nil {
+		if err = s.writeToBackend(clientAddr, session, packet); err != nil {
+			if isRawRaknetifyWriteTimeout(err) {
+				rawRaknetifyMetrics.recordDroppedPacket("client_to_backend", "write_timeout")
+				rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "timeout")
+				s.log.V(1).Info("dropping raw raknetify packet after backend write timed out", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
+				continue
+			}
+			rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "error")
 			s.log.V(1).Info("closing raw raknetify session after backend write failed", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
-			s.closeSession(clientAddr.String(), session)
+			s.closeSession(clientAddr.String(), session, "backend_write_error")
 		}
 	}
 }
@@ -166,9 +178,11 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 			existing.touch(time.Now())
 			return existing, nil
 		}
-		s.closeSession(key, existing)
+		rawRaknetifyMetrics.recordSessionEvent("replaced", "")
+		s.closeSession(key, existing, "replaced")
 	}
 	if s.sessionCount.Load() >= rawRaknetifyMaxSessions {
+		rawRaknetifyMetrics.recordSessionEvent("rejected", "session_limit")
 		return nil, fmt.Errorf("raw raknetify session limit reached")
 	}
 
@@ -195,6 +209,8 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 	session.touch(time.Now())
 	s.sessions.Store(key, session)
 	s.sessionCount.Add(1)
+	rawRaknetifyMetrics.addActiveSessions(1)
+	rawRaknetifyMetrics.recordSessionEvent("created", "")
 
 	log.Info("created raw raknetify session", "clientAddr", clientAddr, "backendAddr", backendAddr)
 	go s.copyBackendToClient(key, clientAddr, session)
@@ -228,6 +244,29 @@ func setRawRaknetifyUDPQoS(log logr.Logger, name string, conn *net.UDPConn, tos 
 	if err := ipv6.NewPacketConn(conn).SetTrafficClass(tos); err != nil {
 		log.V(1).Info("failed to set raw raknetify IPv6 traffic class", "socket", name, "trafficClass", tos, "error", err)
 	}
+}
+
+func (s *rawRaknetifyServer) writeToBackend(clientAddr net.Addr, session *rawRaknetifySession, packet []byte) error {
+	if err := session.backendConn.SetWriteDeadline(time.Now().Add(rawRaknetifyWriteTimeout)); err != nil {
+		rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "deadline_error")
+		s.log.V(1).Info("failed to set raw raknetify backend write deadline", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "timeout", rawRaknetifyWriteTimeout, "error", err)
+	}
+	_, err := session.backendConn.Write(packet)
+	return err
+}
+
+func (s *rawRaknetifyServer) writeToClient(clientAddr net.Addr, session *rawRaknetifySession, packet []byte) error {
+	if err := s.conn.SetWriteDeadline(time.Now().Add(rawRaknetifyWriteTimeout)); err != nil {
+		rawRaknetifyMetrics.recordWriteFailure("backend_to_client", "deadline_error")
+		s.log.V(1).Info("failed to set raw raknetify client write deadline", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "timeout", rawRaknetifyWriteTimeout, "error", err)
+	}
+	_, err := s.conn.WriteTo(packet, clientAddr)
+	return err
+}
+
+func isRawRaknetifyWriteTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func (s *rawRaknetifyServer) resolveBackend(host string, clientAddr net.Addr) (*net.UDPAddr, string, *config.Route, logr.Logger, error) {
@@ -285,19 +324,26 @@ func (s *rawRaknetifyServer) copyBackendToClient(key string, clientAddr net.Addr
 		n, err := session.backendConn.Read(buf)
 		if err != nil {
 			s.log.V(1).Info("closing raw raknetify session after backend read failed", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
-			s.closeSession(key, session)
+			s.closeSession(key, session, "backend_read_error")
 			return
 		}
 		session.touch(time.Now())
-		if _, err = s.conn.WriteTo(buf[:n], clientAddr); err != nil {
+		if err = s.writeToClient(clientAddr, session, buf[:n]); err != nil {
+			if isRawRaknetifyWriteTimeout(err) {
+				rawRaknetifyMetrics.recordDroppedPacket("backend_to_client", "write_timeout")
+				rawRaknetifyMetrics.recordWriteFailure("backend_to_client", "timeout")
+				s.log.V(1).Info("dropping raw raknetify packet after client write timed out", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
+				continue
+			}
+			rawRaknetifyMetrics.recordWriteFailure("backend_to_client", "error")
 			s.log.V(1).Info("closing raw raknetify session after client write failed", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
-			s.closeSession(key, session)
+			s.closeSession(key, session, "client_write_error")
 			return
 		}
 	}
 }
 
-func (s *rawRaknetifyServer) closeSession(key string, expected *rawRaknetifySession) {
+func (s *rawRaknetifyServer) closeSession(key string, expected *rawRaknetifySession, reason string) {
 	var session *rawRaknetifySession
 	if expected != nil {
 		if !s.sessions.CompareAndDelete(key, expected) {
@@ -317,6 +363,8 @@ func (s *rawRaknetifyServer) closeSession(key string, expected *rawRaknetifySess
 	}
 	session.close()
 	s.sessionCount.Add(-1)
+	rawRaknetifyMetrics.addActiveSessions(-1)
+	rawRaknetifyMetrics.recordSessionEvent("closed", reason)
 }
 
 func (s *rawRaknetifyServer) closeAllSessions() {
@@ -324,7 +372,7 @@ func (s *rawRaknetifyServer) closeAllSessions() {
 		keyStr, keyOK := key.(string)
 		session, sessionOK := value.(*rawRaknetifySession)
 		if keyOK && sessionOK {
-			s.closeSession(keyStr, session)
+			s.closeSession(keyStr, session, "shutdown")
 		}
 		return true
 	})
@@ -335,7 +383,7 @@ func (s *rawRaknetifyServer) closeIdleSessions(cutoff int64) {
 		session, sessionOK := value.(*rawRaknetifySession)
 		keyStr, keyOK := key.(string)
 		if sessionOK && keyOK && session.lastSeen.Load() < cutoff {
-			s.closeSession(keyStr, session)
+			s.closeSession(keyStr, session, "idle_timeout")
 		}
 		return true
 	})

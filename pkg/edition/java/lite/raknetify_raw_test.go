@@ -166,7 +166,7 @@ func TestRawRaknetifyV2HintTokenDeduplicatesRetries(t *testing.T) {
 	if replacement == first {
 		t.Fatal("new v2 route token reused the previous session")
 	}
-	srv.closeSession(clientAddr.String(), first)
+	srv.closeSession(clientAddr.String(), first, "test")
 	if loaded, ok := srv.loadSession(clientAddr); !ok || loaded != replacement {
 		t.Fatal("closing the old session removed the replacement session")
 	}
