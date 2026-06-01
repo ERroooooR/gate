@@ -20,21 +20,32 @@ import (
 const (
 	rawRaknetifyRouteHintPacketID = byte(0xfe)
 	rawRaknetifyRouteHintVersion  = byte(1)
+	rawRaknetifyRouteHintVersion2 = byte(2)
+	rawRaknetifyRouteTokenLen     = 16
 	rawRaknetifyMaxHintHostLen    = 1024
 	rawRaknetifyIdleTimeout       = time.Minute
 	rawRaknetifySweepInterval     = 15 * time.Second
 	rawRaknetifyMaxSessions       = 4096
+	rawRaknetifySocketBufferSize  = 4 * 1024 * 1024
 )
 
 var rawRaknetifyRouteHintMagic = []byte("GATE_RAKNET_ROUTE")
 
 type rawRaknetifySession struct {
 	host        string
+	routeToken  string
+	hasToken    bool
 	backendAddr *net.UDPAddr
 	backendConn *net.UDPConn
 	decrement   func()
 	lastSeen    atomic.Int64
 	closeOnce   sync.Once
+}
+
+type rawRaknetifyRouteHint struct {
+	host     string
+	token    string
+	hasToken bool
 }
 
 func (s *rawRaknetifySession) touch(now time.Time) {
@@ -68,6 +79,9 @@ func ServeRaknetifyRaw(ctx context.Context, opts RaknetifyOptions) error {
 
 	log := opts.Logger.WithName("lite").WithName("raknetify").WithName("raw").WithValues("bind", pc.LocalAddr())
 	log.Info("raw raknetify lite listener started")
+	if udpConn, ok := pc.(*net.UDPConn); ok {
+		tuneRawRaknetifyUDPConn(log, "listener", udpConn)
+	}
 
 	srv := &rawRaknetifyServer{
 		conn:            pc,
@@ -105,13 +119,14 @@ func (s *rawRaknetifyServer) serve(ctx context.Context) error {
 			return err
 		}
 		packet := buf[:n]
-		if host, ok, err := decodeRawRaknetifyRouteHint(packet); ok {
+		if hint, ok, err := decodeRawRaknetifyRouteHint(packet); ok {
 			if err != nil {
 				s.log.V(1).Info("dropping invalid raw raknetify route hint", "clientAddr", clientAddr, "error", err)
 				continue
 			}
-			if _, err = s.ensureSession(clientAddr, cleanRawRaknetifyHost(host)); err != nil {
-				s.log.Info("failed to create raw raknetify session", "clientAddr", clientAddr, "host", host, "error", err)
+			hint.host = cleanRawRaknetifyHost(hint.host)
+			if _, err = s.ensureSession(clientAddr, hint); err != nil {
+				s.log.Info("failed to create raw raknetify session", "clientAddr", clientAddr, "host", hint.host, "error", err)
 			}
 			continue
 		}
@@ -124,7 +139,7 @@ func (s *rawRaknetifyServer) serve(ctx context.Context) error {
 		session.touch(time.Now())
 		if _, err = session.backendConn.Write(packet); err != nil {
 			s.log.V(1).Info("closing raw raknetify session after backend write failed", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
-			s.closeSession(clientAddr.String())
+			s.closeSession(clientAddr.String(), session)
 		}
 	}
 }
@@ -138,22 +153,23 @@ func (s *rawRaknetifyServer) loadSession(clientAddr net.Addr) (*rawRaknetifySess
 	return session, ok
 }
 
-func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, host string) (*rawRaknetifySession, error) {
-	if host == "" {
+func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetifyRouteHint) (*rawRaknetifySession, error) {
+	if hint.host == "" {
 		return nil, fmt.Errorf("empty route hint host")
 	}
+	key := clientAddr.String()
 	if existing, ok := s.loadSession(clientAddr); ok {
-		if strings.EqualFold(existing.host, host) {
+		if existing.sameRouteHint(hint) {
 			existing.touch(time.Now())
 			return existing, nil
 		}
-		s.closeSession(clientAddr.String())
+		s.closeSession(key, existing)
 	}
 	if s.sessionCount.Load() >= rawRaknetifyMaxSessions {
 		return nil, fmt.Errorf("raw raknetify session limit reached")
 	}
 
-	backendAddr, backendKey, route, log, err := s.resolveBackend(host, clientAddr)
+	backendAddr, backendKey, route, log, err := s.resolveBackend(hint.host, clientAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -161,9 +177,12 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, host string) (*r
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial raw raknetify backend %s: %w", backendAddr, err)
 	}
+	tuneRawRaknetifyUDPConn(log, "backend", backendConn)
 
 	session := &rawRaknetifySession{
-		host:        host,
+		host:        hint.host,
+		routeToken:  hint.token,
+		hasToken:    hint.hasToken,
 		backendAddr: backendAddr,
 		backendConn: backendConn,
 	}
@@ -171,12 +190,31 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, host string) (*r
 		session.decrement = s.strategyManager.IncrementConnection(backendKey)
 	}
 	session.touch(time.Now())
-	s.sessions.Store(clientAddr.String(), session)
+	s.sessions.Store(key, session)
 	s.sessionCount.Add(1)
 
 	log.Info("created raw raknetify session", "clientAddr", clientAddr, "backendAddr", backendAddr)
-	go s.copyBackendToClient(clientAddr.String(), clientAddr, session)
+	go s.copyBackendToClient(key, clientAddr, session)
 	return session, nil
+}
+
+func (s *rawRaknetifySession) sameRouteHint(hint rawRaknetifyRouteHint) bool {
+	if !strings.EqualFold(s.host, hint.host) {
+		return false
+	}
+	if s.hasToken && hint.hasToken {
+		return s.routeToken == hint.token
+	}
+	return false
+}
+
+func tuneRawRaknetifyUDPConn(log logr.Logger, name string, conn *net.UDPConn) {
+	if err := conn.SetReadBuffer(rawRaknetifySocketBufferSize); err != nil {
+		log.V(1).Info("failed to set raw raknetify UDP read buffer", "socket", name, "bytes", rawRaknetifySocketBufferSize, "error", err)
+	}
+	if err := conn.SetWriteBuffer(rawRaknetifySocketBufferSize); err != nil {
+		log.V(1).Info("failed to set raw raknetify UDP write buffer", "socket", name, "bytes", rawRaknetifySocketBufferSize, "error", err)
+	}
 }
 
 func (s *rawRaknetifyServer) resolveBackend(host string, clientAddr net.Addr) (*net.UDPAddr, string, *config.Route, logr.Logger, error) {
@@ -234,27 +272,60 @@ func (s *rawRaknetifyServer) copyBackendToClient(key string, clientAddr net.Addr
 		n, err := session.backendConn.Read(buf)
 		if err != nil {
 			s.log.V(1).Info("closing raw raknetify session after backend read failed", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
-			s.closeSession(key)
+			s.closeSession(key, session)
 			return
 		}
 		session.touch(time.Now())
 		if _, err = s.conn.WriteTo(buf[:n], clientAddr); err != nil {
 			s.log.V(1).Info("closing raw raknetify session after client write failed", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
-			s.closeSession(key)
+			s.closeSession(key, session)
 			return
 		}
 	}
 }
 
-func (s *rawRaknetifyServer) closeSession(key string) {
-	value, ok := s.sessions.LoadAndDelete(key)
-	if !ok {
-		return
+func (s *rawRaknetifyServer) closeSession(key string, expected *rawRaknetifySession) {
+	var session *rawRaknetifySession
+	if expected != nil {
+		if !s.sessions.CompareAndDelete(key, expected) {
+			return
+		}
+		session = expected
+	} else {
+		value, ok := s.sessions.LoadAndDelete(key)
+		if !ok {
+			return
+		}
+		var valid bool
+		session, valid = value.(*rawRaknetifySession)
+		if !valid {
+			return
+		}
 	}
-	if session, ok := value.(*rawRaknetifySession); ok {
-		session.close()
-		s.sessionCount.Add(-1)
-	}
+	session.close()
+	s.sessionCount.Add(-1)
+}
+
+func (s *rawRaknetifyServer) closeAllSessions() {
+	s.sessions.Range(func(key, value any) bool {
+		keyStr, keyOK := key.(string)
+		session, sessionOK := value.(*rawRaknetifySession)
+		if keyOK && sessionOK {
+			s.closeSession(keyStr, session)
+		}
+		return true
+	})
+}
+
+func (s *rawRaknetifyServer) closeIdleSessions(cutoff int64) {
+	s.sessions.Range(func(key, value any) bool {
+		session, sessionOK := value.(*rawRaknetifySession)
+		keyStr, keyOK := key.(string)
+		if sessionOK && keyOK && session.lastSeen.Load() < cutoff {
+			s.closeSession(keyStr, session)
+		}
+		return true
+	})
 }
 
 func (s *rawRaknetifyServer) sweep(ctx context.Context) {
@@ -263,56 +334,57 @@ func (s *rawRaknetifyServer) sweep(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			s.sessions.Range(func(key, _ any) bool {
-				if keyStr, ok := key.(string); ok {
-					s.closeSession(keyStr)
-				}
-				return true
-			})
+			s.closeAllSessions()
 			return
 		case now := <-ticker.C:
-			cutoff := now.Add(-rawRaknetifyIdleTimeout).UnixNano()
-			s.sessions.Range(func(key, value any) bool {
-				session, ok := value.(*rawRaknetifySession)
-				keyStr, keyOK := key.(string)
-				if ok && keyOK && session.lastSeen.Load() < cutoff {
-					s.closeSession(keyStr)
-				}
-				return true
-			})
+			s.closeIdleSessions(now.Add(-rawRaknetifyIdleTimeout).UnixNano())
 		}
 	}
 }
 
-func decodeRawRaknetifyRouteHint(packet []byte) (host string, ok bool, err error) {
+func decodeRawRaknetifyRouteHint(packet []byte) (hint rawRaknetifyRouteHint, ok bool, err error) {
 	if len(packet) == 0 || packet[0] != rawRaknetifyRouteHintPacketID {
-		return "", false, nil
+		return rawRaknetifyRouteHint{}, false, nil
 	}
 	offset := 1
-	if len(packet) < offset+len(rawRaknetifyRouteHintMagic)+1+2 {
-		return "", true, fmt.Errorf("route hint packet is too short")
+	if len(packet) < offset+len(rawRaknetifyRouteHintMagic)+1 {
+		return rawRaknetifyRouteHint{}, true, fmt.Errorf("route hint packet is too short")
 	}
 	if !bytes.Equal(packet[offset:offset+len(rawRaknetifyRouteHintMagic)], rawRaknetifyRouteHintMagic) {
-		return "", true, fmt.Errorf("route hint magic mismatch")
+		return rawRaknetifyRouteHint{}, true, fmt.Errorf("route hint magic mismatch")
 	}
 	offset += len(rawRaknetifyRouteHintMagic)
-	if packet[offset] != rawRaknetifyRouteHintVersion {
-		return "", true, fmt.Errorf("unsupported route hint version %d", packet[offset])
-	}
+	version := packet[offset]
 	offset++
+	switch version {
+	case rawRaknetifyRouteHintVersion:
+	case rawRaknetifyRouteHintVersion2:
+		if len(packet) < offset+rawRaknetifyRouteTokenLen {
+			return rawRaknetifyRouteHint{}, true, fmt.Errorf("route hint packet is too short")
+		}
+		hint.token = string(packet[offset : offset+rawRaknetifyRouteTokenLen])
+		hint.hasToken = true
+		offset += rawRaknetifyRouteTokenLen
+	default:
+		return rawRaknetifyRouteHint{}, true, fmt.Errorf("unsupported route hint version %d", version)
+	}
+	if len(packet) < offset+2 {
+		return rawRaknetifyRouteHint{}, true, fmt.Errorf("route hint packet is too short")
+	}
 	hostLen := int(binary.BigEndian.Uint16(packet[offset : offset+2]))
 	offset += 2
 	if hostLen == 0 || hostLen > rawRaknetifyMaxHintHostLen {
-		return "", true, fmt.Errorf("invalid route hint host length %d", hostLen)
+		return rawRaknetifyRouteHint{}, true, fmt.Errorf("invalid route hint host length %d", hostLen)
 	}
 	if len(packet) != offset+hostLen {
-		return "", true, fmt.Errorf("route hint length mismatch")
+		return rawRaknetifyRouteHint{}, true, fmt.Errorf("route hint length mismatch")
 	}
 	hostBytes := packet[offset:]
 	if !utf8.Valid(hostBytes) {
-		return "", true, fmt.Errorf("route hint host is not valid UTF-8")
+		return rawRaknetifyRouteHint{}, true, fmt.Errorf("route hint host is not valid UTF-8")
 	}
-	return string(hostBytes), true, nil
+	hint.host = string(hostBytes)
+	return hint, true, nil
 }
 
 func cleanRawRaknetifyHost(host string) string {
