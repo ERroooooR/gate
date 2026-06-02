@@ -104,7 +104,8 @@ type Conn struct {
 	// received over the last second. When ticked, all of these packets are sent
 	// in an ACK and the slice is cleared.
 	ackSlice     []uint24
-	firstAckNano int64 // tracks when the first ACK was queued for time-based flush
+	firstAckNano int64       // tracks when the first ACK was queued for time-based flush
+	ackFlushTimer *time.Timer // fires after ackFlushDelayNanos to flush ACKs early
 
 	// packetQueues are ordered queues containing packets indexed by their order
 	// index, scoped per RakNet order channel.
@@ -215,9 +216,10 @@ func (conn *Conn) receiveOrQueue(b *bytes.Buffer) error {
 // out.
 func (conn *Conn) startTicking() {
 	var (
-		ticker   = time.NewTicker(tickInterval)
-		i        int64
-		acksLeft int
+		ticker      = time.NewTicker(tickInterval)
+		i           int64
+		acksLeft    int
+		lastPingAt  time.Time
 	)
 	defer ticker.Stop()
 	for {
@@ -225,36 +227,47 @@ func (conn *Conn) startTicking() {
 		case t := <-ticker.C:
 			i++
 			conn.flushACKs()
-			if i%20 == 0 {
-				// We send a connected ping to calculate the rtt and let the
-				// other side know we haven't timed out.
+
+			// Adaptive ping: interval = max(50ms, min(RTT, 500ms)).
+			// Defaults to 200ms when RTT hasn't been measured yet.
+			// Matches netty-raknet PingProducer.scheduleNextPing.
+			rtt := conn.retransmission.rtt()
+			pingInterval := defaultPingInterval
+			if rtt != 0 {
+				pingInterval = maxDuration(minPingInterval, minDuration(rtt, maxPingInterval))
+			}
+			if t.Sub(lastPingAt) >= pingInterval {
+				lastPingAt = t
 				conn.sendPing()
 			}
+
 			conn.checkResend(t)
 			// Clean up expired fragment splits every fragmentCleanupInterval (500ms = 10 ticks)
 			if i%10 == 0 {
 				conn.cleanupExpiredFragments()
 			}
-			// Adaptive dead connection detection (matches netty-raknet PingProducer.checkDeadConnection)
+			// Adaptive dead connection detection (matches netty-raknet PingProducer.checkDeadConnection).
+			// Replaces the old fixed 5s + 2*rtt floor with pure adaptive interval.
 			if i%10 == 0 {
 				conn.mu.Lock()
-				inactive := t.Sub(*conn.lastActivity.Load())
-				// Use adaptive interval: max(50ms, min(RTT, 500ms)) * maxMissedPongs
-				rtt := conn.retransmission.rtt()
-				var pingInterval time.Duration
-				if rtt == 0 {
-					pingInterval = defaultPingInterval
-				} else {
+				pingInterval := defaultPingInterval
+				if rtt != 0 {
 					pingInterval = maxDuration(minPingInterval, minDuration(rtt, maxPingInterval))
 				}
-				deadline := pingInterval * maxMissedPongs * 2 // extra grace for initial period
 				lastPong := conn.lastPongNanos.Load()
-				if lastPong != 0 {
-					deadline = pingInterval * maxMissedPongs
-					inactive = time.Duration(time.Now().UnixNano() - lastPong)
+				var elapsed time.Duration
+				var maxMissed int
+				if lastPong == 0 {
+					// No pong ever received — use connection start time with double grace.
+					// Matches netty-raknet referenceNanos = firstPingNanos, maxMissed = MAX_MISSED_PONGS * 2.
+					elapsed = time.Duration(time.Now().UnixNano() - conn.firstActivityNanos)
+					maxMissed = maxMissedPongs * 2
+				} else {
+					elapsed = time.Duration(time.Now().UnixNano() - lastPong)
+					maxMissed = maxMissedPongs
 				}
-				if inactive > deadline && inactive > time.Second*5+conn.retransmission.rtt()*2 {
-					// No activity for too long: Start timeout.
+				deadline := pingInterval * time.Duration(maxMissed)
+				if elapsed > deadline {
 					_ = conn.Close()
 				}
 				conn.mu.Unlock()
@@ -285,6 +298,12 @@ func (conn *Conn) flushACKs() {
 	conn.ackMu.Lock()
 	defer conn.ackMu.Unlock()
 
+	// Cancel any pending timer-based flush since we're flushing now.
+	if conn.ackFlushTimer != nil {
+		conn.ackFlushTimer.Stop()
+		conn.ackFlushTimer = nil
+	}
+
 	if len(conn.ackSlice) > 0 {
 		// Write an ACK packet to the connection containing all datagram
 		// sequence numbers that we received since the last tick.
@@ -292,6 +311,7 @@ func (conn *Conn) flushACKs() {
 			return
 		}
 		conn.ackSlice = conn.ackSlice[:0]
+		conn.firstAckNano = 0
 	}
 }
 
@@ -548,6 +568,14 @@ func (conn *Conn) Close() error {
 // connection and closes the underlying UDP connection immediately.
 func (conn *Conn) closeImmediately() {
 	conn.once.Do(func() {
+		// Stop any pending ACK flush timer.
+		conn.ackMu.Lock()
+		if conn.ackFlushTimer != nil {
+			conn.ackFlushTimer.Stop()
+			conn.ackFlushTimer = nil
+		}
+		conn.ackMu.Unlock()
+
 		_, _ = conn.Write([]byte{message.IDDisconnectNotification})
 		close(conn.closed)
 		if conn.close != nil {
@@ -750,27 +778,40 @@ func (conn *Conn) queueACK(seq uint24) error {
 	conn.ackMu.Lock()
 	defer conn.ackMu.Unlock()
 
-	// Track first ACK time for time-based flush (matches netty-raknet ACK_FLUSH_DELAY_NANOS)
+	// Track first ACK time and schedule a 2ms timer for early flush.
+	// This matches netty-raknet's ACK_FLUSH_DELAY_NANOS time-based trigger.
 	if len(conn.ackSlice) == 0 {
 		conn.firstAckNano = time.Now().UnixNano()
+		if conn.ackFlushTimer == nil {
+			conn.ackFlushTimer = time.AfterFunc(time.Duration(ackFlushDelayNanos), func() {
+				conn.ackMu.Lock()
+				defer conn.ackMu.Unlock()
+				conn.ackFlushTimer = nil
+				if len(conn.ackSlice) > 0 {
+					_ = conn.sendACK(conn.ackSlice...)
+					conn.ackSlice = conn.ackSlice[:0]
+					conn.firstAckNano = 0
+				}
+			})
+		}
 	}
 
 	// Add this sequence number to the received datagrams, so that it is
 	// included in an ACK.
 	conn.ackSlice = append(conn.ackSlice, seq)
 
-	// Flush on count threshold OR time threshold (2ms), whichever comes first.
-	// Matches netty-raknet ReliabilityHandler.trySendResponses.
-	countTrigger := len(conn.ackSlice) >= ackFlushThreshold
-	timeTrigger := len(conn.ackSlice) > 0 && time.Now().UnixNano()-conn.firstAckNano > ackFlushDelayNanos
-	if !countTrigger && !timeTrigger {
-		return nil
+	// Flush on count threshold — cancel timer since we're flushing now.
+	if len(conn.ackSlice) >= ackFlushThreshold {
+		if conn.ackFlushTimer != nil {
+			conn.ackFlushTimer.Stop()
+			conn.ackFlushTimer = nil
+		}
+		if err := conn.sendACK(conn.ackSlice...); err != nil {
+			return err
+		}
+		conn.ackSlice = conn.ackSlice[:0]
+		conn.firstAckNano = 0
 	}
-	if err := conn.sendACK(conn.ackSlice...); err != nil {
-		return err
-	}
-	conn.ackSlice = conn.ackSlice[:0]
-	conn.firstAckNano = 0
 	return nil
 }
 
@@ -1048,7 +1089,7 @@ func (conn *Conn) handleNACK(b *bytes.Buffer) error {
 // numbers passed.
 func (conn *Conn) resend(sequenceNumbers []uint24) (err error) {
 	for _, sequenceNumber := range sequenceNumbers {
-		pk, ok := conn.retransmission.retransmit(sequenceNumber)
+		pk, retryCount, ok := conn.retransmission.retransmit(sequenceNumber)
 		if !ok {
 			// We could not resend this datagram. Maybe it was already resent
 			// before at the request of the client. This is generally expected
@@ -1072,7 +1113,8 @@ func (conn *Conn) resend(sequenceNumbers []uint24) (err error) {
 		}
 		// We then re-add the pk to the recovery queue in case the new one gets
 		// lost too, in which case we need to resend it again.
-		conn.retransmission.add(newSeqNum, pk)
+		// Preserve retryCount so exponential backoff accumulates across retransmissions.
+		conn.retransmission.addWithRetryCount(newSeqNum, pk, retryCount)
 		conn.buf.Reset()
 	}
 	return nil

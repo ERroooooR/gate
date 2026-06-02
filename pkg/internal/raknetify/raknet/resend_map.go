@@ -41,6 +41,12 @@ func (m *resendMap) add(index uint24, pk *packet) {
 	m.unacknowledged[index] = resendRecord{pk: pk, timestamp: time.Now()}
 }
 
+// addWithRetryCount puts a packet at the index passed with an existing retryCount,
+// preserving it across retransmissions for exponential backoff.
+func (m *resendMap) addWithRetryCount(index uint24, pk *packet, retryCount int) {
+	m.unacknowledged[index] = resendRecord{pk: pk, timestamp: time.Now(), retryCount: retryCount}
+}
+
 // acknowledge marks a packet with the index passed as acknowledged. The packet
 // is removed from the resendMap and returned if found.
 func (m *resendMap) acknowledge(index uint24) (*packet, bool) {
@@ -48,16 +54,22 @@ func (m *resendMap) acknowledge(index uint24) (*packet, bool) {
 }
 
 // retransmit looks up a packet with an index from the resendMap so that it may
-// be resent. Increments the retry count on the record.
-func (m *resendMap) retransmit(index uint24) (*packet, bool) {
-	record, ok := m.unacknowledged[index]
-	if !ok {
-		return nil, false
+// be resent. Increments the retry count on the record and returns it alongside
+// the packet so the caller can preserve it when re-adding.
+func (m *resendMap) retransmit(index uint24) (pk *packet, retryCount int, ok bool) {
+	record, found := m.unacknowledged[index]
+	if !found {
+		return nil, 0, false
 	}
-	// Increment retry count for exponential backoff
+	// Increment retry count for exponential backoff BEFORE removing.
+	// The caller must use addWithRetryCount to preserve this across re-adds.
 	record.retryCount++
-	m.unacknowledged[index] = record
-	return m.remove(index, 1)
+	newCount := record.retryCount
+	delete(m.unacknowledged, index)
+
+	now := time.Now()
+	m.delays[now] = now.Sub(record.timestamp)
+	return record.pk, newCount, true
 }
 
 // remove deletes an index from the resendMap and adds the time since the
