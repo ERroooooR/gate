@@ -1,4 +1,4 @@
-package raknet
+﻿package raknet
 
 import (
 	"bytes"
@@ -30,9 +30,6 @@ const (
 	// packet before the incomplete fragments are discarded. Matches netty-raknet's
 	// raknetify.fragmentTimeoutSecs default of 3 seconds.
 	fragmentTimeout = time.Second * 3
-
-	// fragmentCleanupInterval is how often expired fragments are swept.
-	fragmentCleanupInterval = time.Millisecond * 500
 
 	// ackFlushDelayNanos is the time-based ACK flush threshold (2ms), matching
 	// netty-raknet's ACK_FLUSH_DELAY_NANOS for lower latency ACKs.
@@ -132,6 +129,9 @@ type Conn struct {
 	// (handlerAdded equivalent), used for initial grace period.
 	// Uses time.Time for monotonic-clock-safe elapsed via time.Since.
 	firstActivityAt time.Time
+	// hasRTT is set true when the first real RTT sample arrives via an ACK.
+	// Used to distinguish the unreliabled 50ms fallback in rtt() from actual measurements.
+	hasRTT atomic.Bool
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -230,13 +230,12 @@ func (conn *Conn) startTicking() {
 			conn.flushACKs()
 
 			// Adaptive ping: interval = max(50ms, min(RTT, 500ms)).
-			// Uses conn.rtt (atomic) to avoid concurrent map access on resendMap;
-			// rtt starts at 0 so defaultPingInterval (200ms) is used until the
-			// first RTT measurement from checkResend. Matches netty-raknet.
-			rttNanos := conn.rtt.Load()
+			// Uses hasRTT to distinguish real RTT measurements from the 50ms fallback
+			// in resendMap.rtt(); defaultPingInterval (200ms) is used until the first
+			// ACK arrives with a genuine RTT sample. Matches netty-raknet.
 			pingInterval := defaultPingInterval
-			if rttNanos != 0 {
-				rttDur := time.Duration(rttNanos)
+			if conn.hasRTT.Load() {
+				rttDur := time.Duration(conn.rtt.Load())
 				pingInterval = maxDuration(minPingInterval, minDuration(rttDur, maxPingInterval))
 			}
 			if t.Sub(lastPingAt) >= pingInterval {
@@ -253,10 +252,9 @@ func (conn *Conn) startTicking() {
 			// Replaces the old fixed 5s + 2*rtt floor with pure adaptive interval.
 			if i%10 == 0 {
 				conn.mu.Lock()
-				rttNanos := conn.rtt.Load()
 				pingInterval := defaultPingInterval
-				if rttNanos != 0 {
-					rttDur := time.Duration(rttNanos)
+				if conn.hasRTT.Load() {
+					rttDur := time.Duration(conn.rtt.Load())
 					pingInterval = maxDuration(minPingInterval, minDuration(rttDur, maxPingInterval))
 				}
 				lastPong := conn.lastPongAt.Load()

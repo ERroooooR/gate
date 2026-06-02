@@ -1,4 +1,4 @@
-package lite
+﻿package lite
 
 import (
 	"bytes"
@@ -533,12 +533,16 @@ func (s *rawRaknetifyServer) closeSession(session *rawRaknetifySession, reason s
 	if session == nil {
 		return
 	}
-	// Hold migrationMu so migrateSessionClient cannot change clientKey between
-	// our read of currentClientKey() and the CompareAndDelete below.
+	// Atomically remove from both maps under migrationMu to prevent a race
+	// where ensureSession finds the session via tokenSessions after sessions
+	// is cleaned but before the session is actually closed.
 	s.migrationMu.Lock()
 	key := session.currentClientKey()
 	if key != "" {
 		s.sessions.CompareAndDelete(key, session)
+	}
+	if session.tokenKey != "" {
+		s.tokenSessions.CompareAndDelete(session.tokenKey, session)
 	}
 	s.migrationMu.Unlock()
 
@@ -546,8 +550,9 @@ func (s *rawRaknetifyServer) closeSession(session *rawRaknetifySession, reason s
 }
 
 // finalizeSessionClose completes the non-map parts of session cleanup.
-// It does NOT acquire migrationMu, so it is safe to call from within
-// migrateSessionClient (which already holds migrationMu).
+// tokenSessions is cleaned up by closeSession under migrationMu before
+// calling this; the CompareAndDelete here is kept for the migrateSessionClient
+// conflict path where migrationMu is already held by the caller.
 func (s *rawRaknetifyServer) finalizeSessionClose(session *rawRaknetifySession, reason string) {
 	if session == nil {
 		return

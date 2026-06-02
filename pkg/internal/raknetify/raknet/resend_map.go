@@ -13,9 +13,6 @@ type resendMap struct {
 	cachedRTT      time.Duration
 	cachedRTTAt    time.Time
 	cachedStdDev   time.Duration
-	cachedMinRTT   time.Duration
-	// minRTTResetAt tracks when the minRTT window started, for 10-second sliding window
-	minRTTResetAt time.Time
 }
 
 // resendRecord represents a single packet with a timestamp from when it was
@@ -147,52 +144,4 @@ func (m *resendMap) rttStdDev() time.Duration {
 		m.cachedStdDev = time.Duration(math.Sqrt(totalVariance / float64(records)))
 	}
 	return m.cachedStdDev
-}
-
-// minRTT returns the minimum RTT observed over a 10-second sliding window.
-// This matches the netty-raknet DefaultConfig.getMinRTTNanos() behavior.
-func (m *resendMap) minRTT() time.Duration {
-	const minRTTWindow = time.Second * 10
-	const cacheDuration = time.Millisecond * 250
-	now := time.Now()
-	if m.cachedMinRTT != 0 && now.Sub(m.cachedRTTAt) < cacheDuration {
-		return m.cachedMinRTT
-	}
-
-	// Reset minRTT window every 10 seconds
-	if now.Sub(m.minRTTResetAt) > minRTTWindow {
-		m.minRTTResetAt = now
-		m.cachedMinRTT = 0
-	}
-
-	var (
-		minRTT  time.Duration
-		records int
-	)
-	for t, rtt := range m.delays {
-		if now.Sub(t) > minRTTWindow {
-			continue
-		}
-		if minRTT == 0 || rtt < minRTT {
-			minRTT = rtt
-		}
-		records++
-	}
-	if records == 0 && m.cachedMinRTT == 0 {
-		m.cachedMinRTT = m.rtt() // fallback to average RTT
-	} else if minRTT != 0 {
-		m.cachedMinRTT = minRTT
-	}
-	return m.cachedMinRTT
-}
-
-// retryCount returns the maximum retry count among all unacknowledged records.
-func (m *resendMap) maxRetryCount() int {
-	maxCount := 0
-	for _, record := range m.unacknowledged {
-		if record.retryCount > maxCount {
-			maxCount = record.retryCount
-		}
-	}
-	return maxCount
 }
