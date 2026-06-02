@@ -198,6 +198,12 @@ func (conn *Conn) receiveOrQueue(b *bytes.Buffer) error {
 		return conn.receive(b)
 	}
 
+	// Update lastActivity at enqueue time so dead connection detection sees
+	// fresh activity even when startQueuedReceiver is briefly blocked on conn.mu
+	// (e.g. waiting for handleACK during a large WriteFrame in passthrough mode).
+	now := time.Now()
+	conn.lastActivity.Store(&now)
+
 	datagram := copyQueuedDatagram(b.Bytes())
 	select {
 	case conn.receiveQueue <- datagram:
@@ -249,7 +255,9 @@ func (conn *Conn) startTicking() {
 				conn.cleanupExpiredFragments()
 			}
 			// Adaptive dead connection detection (matches netty-raknet PingProducer.checkDeadConnection).
-			// Replaces the old fixed 5s + 2*rtt floor with pure adaptive interval.
+			// Uses the more recent of lastPongAt and lastActivity as the reference so that
+			// active data transfer (e.g. during passthrough forwarding) keeps the connection alive
+			// even when pong responses are delayed behind data frames in the receive queue.
 			if i%10 == 0 {
 				conn.mu.Lock()
 				pingInterval := defaultPingInterval
@@ -258,17 +266,27 @@ func (conn *Conn) startTicking() {
 					pingInterval = maxDuration(minPingInterval, minDuration(rttDur, maxPingInterval))
 				}
 				lastPong := conn.lastPongAt.Load()
-				var elapsed time.Duration
+				lastActivity := conn.lastActivity.Load()
+				// Start with the best available reference: pong, activity, or connection start.
+				var referenceTime time.Time
 				var maxMissed int
-				if lastPong == nil {
-					// No pong ever received — use connection start time with double grace.
-					// Matches netty-raknet referenceNanos = firstPingNanos, maxMissed = MAX_MISSED_PONGS * 2.
-					elapsed = time.Since(conn.firstActivityAt)
+				if lastPong != nil {
+					referenceTime = *lastPong
+					maxMissed = maxMissedPongs
+				} else if lastActivity != nil {
+					referenceTime = *lastActivity
 					maxMissed = maxMissedPongs * 2
 				} else {
-					elapsed = time.Since(*lastPong)
-					maxMissed = maxMissedPongs
+					referenceTime = conn.firstActivityAt
+					maxMissed = maxMissedPongs * 2
 				}
+				// If lastActivity is more recent than the pong reference, use it instead.
+				// This prevents active connections from being killed during heavy data
+				// transfer where pong responses may be queued behind data frames.
+				if lastActivity != nil && lastActivity.After(referenceTime) {
+					referenceTime = *lastActivity
+				}
+				elapsed := time.Since(referenceTime)
 				deadline := pingInterval * time.Duration(maxMissed)
 				if elapsed > deadline {
 					_ = conn.Close()
