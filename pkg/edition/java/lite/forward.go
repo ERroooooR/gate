@@ -1,4 +1,4 @@
-package lite
+﻿package lite
 
 import (
 	"bytes"
@@ -155,6 +155,14 @@ func forwardRaknetifyPassthrough(
 	if buffered, ok := netmc.Assert[interface{ DrainBufferedFrames() []*raknet.Frame }](client); ok {
 		preReadFrames = buffered.DrainBufferedFrames()
 	}
+
+	// Detach the frame connection to stop the startReadLoop goroutine from
+	// competing with the passthrough pipe for frames. After detach, Read()
+	// returns io.EOF and Close() is a no-op on the underlying RakNet conn.
+	if detachable, ok := netmc.Assert[interface{ DetachFrameConn() raknetFrameConn }](client); ok {
+		src = detachable.DetachFrameConn()
+	}
+	_ = client.Close() // stop the read loop, underlying conn is now detached
 
 	backendAddr, log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, raknetFrameConn, error) {
 		conn, err := dialRaknetifyRoute(client.Context(), dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, preReadFrames, backendTCPBrutal)

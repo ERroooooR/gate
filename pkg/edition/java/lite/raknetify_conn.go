@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -40,9 +41,12 @@ type raknetifyConn struct {
 	readBuf        bytes.Buffer
 	preRead        []*raknet.Frame
 	capturePreRead bool
+	readAborted    bool // set by DetachFrameConn to stop the read loop
 
 	writeMu  sync.Mutex
 	writeBuf []byte
+
+	detached bool // set by DetachFrameConn so Close() leaves underlying conn alive
 }
 
 func newRaknetifyConn(conn raknetFrameConn) net.Conn {
@@ -51,6 +55,10 @@ func newRaknetifyConn(conn raknetFrameConn) net.Conn {
 
 func (c *raknetifyConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
+	if c.readAborted {
+		c.readMu.Unlock()
+		return 0, io.EOF
+	}
 	defer c.readMu.Unlock()
 
 	for c.readBuf.Len() == 0 {
@@ -136,6 +144,9 @@ func peekVarInt(buf []byte) (value int, bytesRead int, complete bool, err error)
 }
 
 func (c *raknetifyConn) Close() error {
+	if c.detached {
+		return nil // underlying conn was detached, don't close it
+	}
 	return c.conn.Close()
 }
 
@@ -160,6 +171,17 @@ func (c *raknetifyConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (c *raknetifyConn) FrameConn() raknetFrameConn {
+	return c.conn
+}
+
+// DetachFrameConn stops the Minecraft read loop and returns the underlying
+// RakNet frame connection. After detach, Close() is a no-op and Read() returns
+// io.EOF, so the caller can take over the frame connection for passthrough.
+func (c *raknetifyConn) DetachFrameConn() raknetFrameConn {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	c.detached = true
+	c.readAborted = true
 	return c.conn
 }
 
