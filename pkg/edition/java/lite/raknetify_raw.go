@@ -33,6 +33,7 @@ const (
 	rawRaknetifyDefaultIPTOS      = 0xA0 // DSCP CS5, matching raknetify DEFAULT_IP_TOS
 	rawRaknetifyWriteTimeout      = 10 * time.Millisecond
 	rawRaknetifyPacingInterval    = 100 * time.Microsecond
+	rawRaknetifyMaxPacingInterval = 100 * time.Millisecond
 	rawRaknetifyBackendQueueSize  = 256
 )
 
@@ -119,8 +120,17 @@ func (s *rawRaknetifySession) currentClientKey() string {
 }
 
 func (s *rawRaknetifySession) enqueueToBackend(packet []byte) bool {
+	// Fast-path: check closed and approximate capacity before allocating.
+	s.queueMu.RLock()
+	if s.closed || len(s.toBackend) >= cap(s.toBackend) {
+		s.queueMu.RUnlock()
+		return false
+	}
+	s.queueMu.RUnlock()
+
 	copied := make([]byte, len(packet))
 	copy(copied, packet)
+
 	s.queueMu.RLock()
 	defer s.queueMu.RUnlock()
 	if s.closed {
@@ -183,6 +193,9 @@ type rawRaknetifyServer struct {
 	sessionCount    atomic.Int64
 	clientWriteMu   sync.Mutex
 	clientTOS       int
+	// migrationMu serializes session close and client address migration to prevent
+	// a race where closeSession sees a partially-updated clientKey during migration.
+	migrationMu sync.Mutex
 }
 
 func (s *rawRaknetifyServer) serve(ctx context.Context) error {
@@ -316,17 +329,25 @@ func (s *rawRaknetifySession) sameRouteHint(hint rawRaknetifyRouteHint) bool {
 	if s.hasToken && hint.hasToken {
 		return s.routeToken == hint.token
 	}
-	return false
+	// v1 hints: neither side has a token, match by host only.
+	// If one has a token and the other doesn't, it's a mismatch.
+	return !s.hasToken && !hint.hasToken
 }
 
 func (s *rawRaknetifyServer) migrateSessionClient(session *rawRaknetifySession, clientAddr net.Addr) (oldKey, newKey string, migrated bool) {
+	s.migrationMu.Lock()
+	defer s.migrationMu.Unlock()
+
 	oldKey, newKey, migrated = session.setClientAddr(clientAddr)
 	if !migrated {
 		return oldKey, newKey, false
 	}
 	if value, ok := s.sessions.Load(newKey); ok {
 		if existing, ok := value.(*rawRaknetifySession); ok && existing != session {
-			s.closeSession(existing, "migration_conflict")
+			// Remove conflicting session from the map under our lock,
+			// then finalize close without re-acquiring migrationMu (no deadlock).
+			s.sessions.CompareAndDelete(newKey, existing)
+			s.finalizeSessionClose(existing, "migration_conflict")
 		}
 	}
 	s.sessions.Store(newKey, session)
@@ -492,10 +513,18 @@ func paceRawRaknetifyWrite(nextWrite time.Time, interval time.Duration) time.Tim
 	if interval <= 0 {
 		return time.Time{}
 	}
+	// Clamp to a reasonable maximum so shutdown does not hang on long sleeps.
+	if interval > rawRaknetifyMaxPacingInterval {
+		interval = rawRaknetifyMaxPacingInterval
+	}
 	now := time.Now()
 	if now.Before(nextWrite) {
-		time.Sleep(nextWrite.Sub(now))
-		now = nextWrite
+		sleepDuration := nextWrite.Sub(now)
+		if sleepDuration > rawRaknetifyMaxPacingInterval {
+			sleepDuration = rawRaknetifyMaxPacingInterval
+		}
+		time.Sleep(sleepDuration)
+		now = time.Now()
 	}
 	return now.Add(interval)
 }
@@ -504,8 +533,23 @@ func (s *rawRaknetifyServer) closeSession(session *rawRaknetifySession, reason s
 	if session == nil {
 		return
 	}
+	// Hold migrationMu so migrateSessionClient cannot change clientKey between
+	// our read of currentClientKey() and the CompareAndDelete below.
+	s.migrationMu.Lock()
 	key := session.currentClientKey()
-	if key != "" && !s.sessions.CompareAndDelete(key, session) {
+	if key != "" {
+		s.sessions.CompareAndDelete(key, session)
+	}
+	s.migrationMu.Unlock()
+
+	s.finalizeSessionClose(session, reason)
+}
+
+// finalizeSessionClose completes the non-map parts of session cleanup.
+// It does NOT acquire migrationMu, so it is safe to call from within
+// migrateSessionClient (which already holds migrationMu).
+func (s *rawRaknetifyServer) finalizeSessionClose(session *rawRaknetifySession, reason string) {
+	if session == nil {
 		return
 	}
 	if session.tokenKey != "" {

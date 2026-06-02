@@ -104,7 +104,7 @@ func TestNormalizeRawRaknetifyBackendAddsDefaultPort(t *testing.T) {
 	}
 }
 
-func TestRawRaknetifyLegacyHintReplacesExistingSession(t *testing.T) {
+func TestRawRaknetifyLegacyHintReusesExistingSession(t *testing.T) {
 	srv, clientAddr, cleanup := newRawRaknetifyTestServer(t)
 	defer cleanup()
 
@@ -116,14 +116,16 @@ func TestRawRaknetifyLegacyHintReplacesExistingSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second ensureSession returned error: %v", err)
 	}
-	if first == second {
-		t.Fatal("legacy route hint reused an existing session")
+	// v1 route hints (no token) with the same host and client address should reuse
+	// the existing session, not destroy and recreate it.
+	if first != second {
+		t.Fatal("legacy route hint did not reuse the existing session")
 	}
 	if srv.sessionCount.Load() != 1 {
 		t.Fatalf("unexpected session count: %d", srv.sessionCount.Load())
 	}
-	if loaded, ok := srv.loadSession(clientAddr); !ok || loaded != second {
-		t.Fatalf("expected the replacement session to remain loaded")
+	if loaded, ok := srv.loadSession(clientAddr); !ok || loaded != first {
+		t.Fatalf("expected the original session to remain loaded")
 	}
 }
 
