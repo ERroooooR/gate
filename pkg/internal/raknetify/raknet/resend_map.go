@@ -1,6 +1,7 @@
 package raknet
 
 import (
+	"math"
 	"time"
 )
 
@@ -11,6 +12,10 @@ type resendMap struct {
 	delays         map[time.Time]time.Duration
 	cachedRTT      time.Duration
 	cachedRTTAt    time.Time
+	cachedStdDev   time.Duration
+	cachedMinRTT   time.Duration
+	// minRTTResetAt tracks when the minRTT window started, for 10-second sliding window
+	minRTTResetAt time.Time
 }
 
 // resendRecord represents a single packet with a timestamp from when it was
@@ -18,6 +23,9 @@ type resendMap struct {
 type resendRecord struct {
 	pk        *packet
 	timestamp time.Time
+	// retryCount tracks how many times this record has been retransmitted.
+	// Used for exponential backoff in the retry timeout calculation.
+	retryCount int
 }
 
 // newRecoveryQueue returns a new initialised recovery queue.
@@ -40,8 +48,15 @@ func (m *resendMap) acknowledge(index uint24) (*packet, bool) {
 }
 
 // retransmit looks up a packet with an index from the resendMap so that it may
-// be resent.
+// be resent. Increments the retry count on the record.
 func (m *resendMap) retransmit(index uint24) (*packet, bool) {
+	record, ok := m.unacknowledged[index]
+	if !ok {
+		return nil, false
+	}
+	// Increment retry count for exponential backoff
+	record.retryCount++
+	m.unacknowledged[index] = record
 	return m.remove(index, 1)
 }
 
@@ -61,7 +76,7 @@ func (m *resendMap) remove(index uint24, mul int) (*packet, bool) {
 
 // rtt returns the average round trip time between the putting of the value
 // into the recovery queue and the taking out of it again. It is measured over
-// the last delayRecordCount values add in.
+// the last averageDuration worth of delay records.
 func (m *resendMap) rtt() time.Duration {
 	const averageDuration = time.Second * 5
 	const cacheDuration = time.Millisecond * 250
@@ -89,4 +104,83 @@ func (m *resendMap) rtt() time.Duration {
 	}
 	m.cachedRTTAt = now
 	return m.cachedRTT
+}
+
+// rttStdDev returns the standard deviation of RTT samples over the last 5 seconds.
+// Returns 0 if there are fewer than 2 samples.
+func (m *resendMap) rttStdDev() time.Duration {
+	const averageDuration = time.Second * 5
+	const cacheDuration = time.Millisecond * 250
+	now := time.Now()
+	if m.cachedStdDev != 0 && now.Sub(m.cachedRTTAt) < cacheDuration {
+		return m.cachedStdDev
+	}
+
+	mean := m.rtt()
+	var (
+		totalVariance float64
+		records       int
+	)
+	for t, rtt := range m.delays {
+		if now.Sub(t) > averageDuration {
+			continue
+		}
+		diff := float64(rtt - mean)
+		totalVariance += diff * diff
+		records++
+	}
+	if records < 2 {
+		m.cachedStdDev = 0
+	} else {
+		m.cachedStdDev = time.Duration(math.Sqrt(totalVariance / float64(records)))
+	}
+	return m.cachedStdDev
+}
+
+// minRTT returns the minimum RTT observed over a 10-second sliding window.
+// This matches the netty-raknet DefaultConfig.getMinRTTNanos() behavior.
+func (m *resendMap) minRTT() time.Duration {
+	const minRTTWindow = time.Second * 10
+	const cacheDuration = time.Millisecond * 250
+	now := time.Now()
+	if m.cachedMinRTT != 0 && now.Sub(m.cachedRTTAt) < cacheDuration {
+		return m.cachedMinRTT
+	}
+
+	// Reset minRTT window every 10 seconds
+	if now.Sub(m.minRTTResetAt) > minRTTWindow {
+		m.minRTTResetAt = now
+		m.cachedMinRTT = 0
+	}
+
+	var (
+		minRTT  time.Duration
+		records int
+	)
+	for t, rtt := range m.delays {
+		if now.Sub(t) > minRTTWindow {
+			continue
+		}
+		if minRTT == 0 || rtt < minRTT {
+			minRTT = rtt
+		}
+		records++
+	}
+	if records == 0 && m.cachedMinRTT == 0 {
+		m.cachedMinRTT = m.rtt() // fallback to average RTT
+	} else if minRTT != 0 {
+		m.cachedMinRTT = minRTT
+	}
+	return m.cachedMinRTT
+}
+
+// retryCount returns the maximum retry count among all unacknowledged records.
+func (m *resendMap) maxRetryCount() int {
+	maxCount := 0
+	for _, record := range m.unacknowledged {
+		if record.retryCount > maxCount {
+			maxCount = record.retryCount
+		}
+	}
+	return maxCount
 }

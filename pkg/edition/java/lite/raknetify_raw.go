@@ -30,7 +30,7 @@ const (
 	rawRaknetifySweepInterval     = 15 * time.Second
 	rawRaknetifyMaxSessions       = 4096
 	rawRaknetifySocketBufferSize  = 4 * 1024 * 1024
-	rawRaknetifyDefaultIPTOS      = 0x18
+	rawRaknetifyDefaultIPTOS      = 0xA0 // DSCP CS5, matching raknetify DEFAULT_IP_TOS
 	rawRaknetifyWriteTimeout      = 10 * time.Millisecond
 	rawRaknetifyPacingInterval    = 100 * time.Microsecond
 	rawRaknetifyBackendQueueSize  = 256

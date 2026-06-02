@@ -25,6 +25,30 @@ const (
 	raknetifyDefaultPendingFrames = 4
 	ackFlushThreshold             = raknetifyDefaultPendingFrames - 1
 	receiveQueueSize              = 512
+
+	// fragmentTimeout is the maximum time to wait for all fragments of a split
+	// packet before the incomplete fragments are discarded. Matches netty-raknet's
+	// raknetify.fragmentTimeoutSecs default of 3 seconds.
+	fragmentTimeout = time.Second * 3
+
+	// fragmentCleanupInterval is how often expired fragments are swept.
+	fragmentCleanupInterval = time.Millisecond * 500
+
+	// ackFlushDelayNanos is the time-based ACK flush threshold (2ms), matching
+	// netty-raknet's ACK_FLUSH_DELAY_NANOS for lower latency ACKs.
+	ackFlushDelayNanos = 2_000_000 // 2ms
+
+	// minPingInterval is the minimum adaptive ping interval, matching netty-raknet.
+	minPingInterval = time.Millisecond * 50
+
+	// maxPingInterval is the maximum adaptive ping interval, matching netty-raknet.
+	maxPingInterval = time.Millisecond * 500
+
+	// defaultPingInterval is the default ping interval used when RTT hasn't been measured yet.
+	defaultPingInterval = time.Millisecond * 200
+
+	// maxMissedPongs is the number of missed pings before declaring a dead connection.
+	maxMissedPongs = 5
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -67,7 +91,8 @@ type Conn struct {
 	// splits is a map of slices indexed by split IDs. The length of each of the
 	// slices is equal to the split count, and packets are positioned in that
 	// slice indexed by the split index.
-	splits map[uint16][][]byte
+	splits      map[uint16][][]byte
+	splitTimes  map[uint16]time.Time // tracks when each split was first created for timeout
 
 	// win is an ordered queue used to track which datagrams were received and
 	// which datagrams were missing, so that we can send NACKs to request
@@ -78,7 +103,8 @@ type Conn struct {
 	// ackSlice is a slice containing sequence numbers of datagrams that were
 	// received over the last second. When ticked, all of these packets are sent
 	// in an ACK and the slice is cleared.
-	ackSlice []uint24
+	ackSlice     []uint24
+	firstAckNano int64 // tracks when the first ACK was queued for time-based flush
 
 	// packetQueues are ordered queues containing packets indexed by their order
 	// index, scoped per RakNet order channel.
@@ -97,6 +123,12 @@ type Conn struct {
 	readDeadline <-chan time.Time
 
 	lastActivity atomic.Pointer[time.Time]
+	// lastPongNanos tracks when the last connected pong was received,
+	// used for adaptive dead connection detection (matches netty-raknet PongHandler).
+	lastPongNanos atomic.Int64
+	// firstActivityNanos tracks when the connection was first established
+	// (handlerAdded equivalent), used for initial grace period.
+	firstActivityNanos int64
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -114,23 +146,26 @@ func newConnWithLimits(conn net.PacketConn, addr net.Addr, mtuSize uint16, limit
 		mtuSize = maxMTUSize
 	}
 	c := &Conn{
-		addr:           addr,
-		conn:           conn,
-		limits:         limits,
-		mtuSize:        mtuSize,
-		pk:             new(packet),
-		closed:         make(chan struct{}),
-		connected:      make(chan struct{}),
-		packets:        make(chan *Frame, 512),
-		splits:         make(map[uint16][][]byte),
-		win:            newDatagramWindow(),
-		retransmission: newRecoveryQueue(),
-		buf:            bytes.NewBuffer(make([]byte, 0, mtuSize)),
-		ackBuf:         bytes.NewBuffer(make([]byte, 0, 256)),
-		nackBuf:        bytes.NewBuffer(make([]byte, 0, 256)),
+		addr:               addr,
+		conn:               conn,
+		limits:             limits,
+		mtuSize:            mtuSize,
+		pk:                 new(packet),
+		closed:             make(chan struct{}),
+		connected:          make(chan struct{}),
+		packets:            make(chan *Frame, 512),
+		splits:             make(map[uint16][][]byte),
+		splitTimes:         make(map[uint16]time.Time),
+		win:                newDatagramWindow(),
+		retransmission:     newRecoveryQueue(),
+		buf:                bytes.NewBuffer(make([]byte, 0, mtuSize)),
+		ackBuf:             bytes.NewBuffer(make([]byte, 0, 256)),
+		nackBuf:            bytes.NewBuffer(make([]byte, 0, 256)),
+		firstActivityNanos: time.Now().UnixNano(),
 	}
 	t := time.Now()
 	c.lastActivity.Store(&t)
+	c.lastPongNanos.Store(0)
 	go c.startTicking()
 	return c
 }
@@ -196,10 +231,29 @@ func (conn *Conn) startTicking() {
 				conn.sendPing()
 			}
 			conn.checkResend(t)
+			// Clean up expired fragment splits every fragmentCleanupInterval (500ms = 10 ticks)
+			if i%10 == 0 {
+				conn.cleanupExpiredFragments()
+			}
+			// Adaptive dead connection detection (matches netty-raknet PingProducer.checkDeadConnection)
 			if i%10 == 0 {
 				conn.mu.Lock()
 				inactive := t.Sub(*conn.lastActivity.Load())
-				if inactive > time.Second*5 && inactive > time.Second*5+conn.retransmission.rtt()*2 {
+				// Use adaptive interval: max(50ms, min(RTT, 500ms)) * maxMissedPongs
+				rtt := conn.retransmission.rtt()
+				var pingInterval time.Duration
+				if rtt == 0 {
+					pingInterval = defaultPingInterval
+				} else {
+					pingInterval = maxDuration(minPingInterval, minDuration(rtt, maxPingInterval))
+				}
+				deadline := pingInterval * maxMissedPongs * 2 // extra grace for initial period
+				lastPong := conn.lastPongNanos.Load()
+				if lastPong != 0 {
+					deadline = pingInterval * maxMissedPongs
+					inactive = time.Duration(time.Now().UnixNano() - lastPong)
+				}
+				if inactive > deadline && inactive > time.Second*5+conn.retransmission.rtt()*2 {
 					// No activity for too long: Start timeout.
 					_ = conn.Close()
 				}
@@ -244,6 +298,8 @@ func (conn *Conn) flushACKs() {
 // checkResend checks if the connection needs to resend any packets. It sends
 // an ACK for packets it has received and sends any packets that have been
 // pending for too long.
+// Uses the netty-raknet formula: baseTimeout = RTT + 2*sd + retryDelay
+// with exponential backoff: 1x, 2x, 4x, 8x (max) based on retry count.
 func (conn *Conn) checkResend(now time.Time) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
@@ -253,24 +309,49 @@ func (conn *Conn) checkResend(now time.Time) {
 	}
 
 	var (
-		resend []uint24
-		rtt    = conn.retransmission.rtt()
-		delay  = maxDuration(rtt+rtt/2, raknetifyRetryDelay)
+		resend      []uint24
+		rttNanos    = conn.retransmission.rtt()
+		sdNanos     = conn.retransmission.rttStdDev()
+		baseTimeout = rttNanos + 2*sdNanos + raknetifyRetryDelay
 	)
-	conn.rtt.Store(int64(rtt))
+	conn.rtt.Store(int64(rttNanos))
 
-	for seq, t := range conn.retransmission.unacknowledged {
-		// These packets have not been acknowledged for too long: We resend them
-		// by ourselves, even though no NACK has been issued yet.
-		if now.Sub(t.timestamp) > delay {
+	for seq, record := range conn.retransmission.unacknowledged {
+		// Exponential backoff: 1x, 2x, 4x, 8x (max) based on retry count.
+		// Matches netty-raknet ReliabilityHandler.recallExpiredFrameSets.
+		multiplier := time.Duration(1 << min(record.retryCount, 3))
+		delay := maxDuration(baseTimeout*multiplier, raknetifyRetryDelay)
+		if now.Sub(record.timestamp) > delay {
 			resend = append(resend, seq)
 		}
 	}
 	_ = conn.resend(resend)
 }
 
+// cleanupExpiredFragments removes incomplete split packet fragments that have
+// exceeded the fragment timeout. Matches netty-raknet FrameJoiner.cleanupExpired.
+func (conn *Conn) cleanupExpiredFragments() {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	now := time.Now()
+	for splitID, startTime := range conn.splitTimes {
+		if now.Sub(startTime) > fragmentTimeout {
+			delete(conn.splits, splitID)
+			delete(conn.splitTimes, splitID)
+		}
+	}
+}
+
 func maxDuration(a, b time.Duration) time.Duration {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
 		return a
 	}
 	return b
@@ -669,16 +750,27 @@ func (conn *Conn) queueACK(seq uint24) error {
 	conn.ackMu.Lock()
 	defer conn.ackMu.Unlock()
 
+	// Track first ACK time for time-based flush (matches netty-raknet ACK_FLUSH_DELAY_NANOS)
+	if len(conn.ackSlice) == 0 {
+		conn.firstAckNano = time.Now().UnixNano()
+	}
+
 	// Add this sequence number to the received datagrams, so that it is
 	// included in an ACK.
 	conn.ackSlice = append(conn.ackSlice, seq)
-	if len(conn.ackSlice) < ackFlushThreshold {
+
+	// Flush on count threshold OR time threshold (2ms), whichever comes first.
+	// Matches netty-raknet ReliabilityHandler.trySendResponses.
+	countTrigger := len(conn.ackSlice) >= ackFlushThreshold
+	timeTrigger := len(conn.ackSlice) > 0 && time.Now().UnixNano()-conn.firstAckNano > ackFlushDelayNanos
+	if !countTrigger && !timeTrigger {
 		return nil
 	}
 	if err := conn.sendACK(conn.ackSlice...); err != nil {
 		return err
 	}
 	conn.ackSlice = conn.ackSlice[:0]
+	conn.firstAckNano = 0
 	return nil
 }
 
@@ -795,6 +887,9 @@ func (conn *Conn) handleConnectedPong(b *bytes.Buffer) error {
 	if packet.ClientTimestamp > timestamp() {
 		return fmt.Errorf("error measuring rtt: ping timestamp is in the future")
 	}
+	// Track last pong time for adaptive dead connection detection.
+	// Matches netty-raknet PongHandler.LAST_PONG_NANOS.
+	conn.lastPongNanos.Store(time.Now().UnixNano())
 	// We don't actually use the ConnectedPong to measure rtt. It is too
 	// unreliable and doesn't give a good idea of the connection quality.
 	return nil
@@ -843,6 +938,7 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	if !ok {
 		m = make([][]byte, p.splitCount)
 		conn.splits[p.splitID] = m
+		conn.splitTimes[p.splitID] = time.Now() // track fragment timeout
 	}
 	if p.splitIndex > uint32(len(m)-1) {
 		// The split index was either negative or was bigger than the slice
@@ -868,6 +964,7 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	}
 
 	delete(conn.splits, p.splitID)
+	delete(conn.splitTimes, p.splitID)
 
 	p.content = content
 	return conn.receivePacket(p)
