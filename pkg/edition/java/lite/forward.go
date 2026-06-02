@@ -162,11 +162,15 @@ func forwardRaknetifyPassthrough(
 	if detachable, ok := netmc.Assert[interface{ DetachFrameConn() raknetFrameConn }](client); ok {
 		src = detachable.DetachFrameConn()
 	}
-	clientCtx := client.Context() // save before Close cancels it
+	clientCtx := client.Context() // snapshot before Close cancels it
 	_ = client.Close() // stop the read loop, underlying conn is now detached
 
+	// context.WithoutCancel strips the cancel signal from the client context
+	// (which was invalidated by Close) while preserving context values like
+	// tracing spans and logr logger for the backend dial.
+	dialCtx := context.WithoutCancel(clientCtx)
 	backendAddr, log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, raknetFrameConn, error) {
-		conn, err := dialRaknetifyRoute(clientCtx, dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, preReadFrames, backendTCPBrutal)
+		conn, err := dialRaknetifyRoute(dialCtx, dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, preReadFrames, backendTCPBrutal)
 		return log, conn, err
 	})
 	if err != nil {
