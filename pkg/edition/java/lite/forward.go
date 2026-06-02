@@ -162,10 +162,11 @@ func forwardRaknetifyPassthrough(
 	if detachable, ok := netmc.Assert[interface{ DetachFrameConn() raknetFrameConn }](client); ok {
 		src = detachable.DetachFrameConn()
 	}
+	clientCtx := client.Context() // save before Close cancels it
 	_ = client.Close() // stop the read loop, underlying conn is now detached
 
 	backendAddr, log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, raknetFrameConn, error) {
-		conn, err := dialRaknetifyRoute(client.Context(), dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, preReadFrames, backendTCPBrutal)
+		conn, err := dialRaknetifyRoute(clientCtx, dialTimeout, log, src.RemoteAddr(), route, backendAddr, handshake, handshakeCtx, preReadFrames, backendTCPBrutal)
 		return log, conn, err
 	})
 	if err != nil {
