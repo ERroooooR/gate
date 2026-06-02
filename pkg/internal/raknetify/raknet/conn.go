@@ -124,12 +124,14 @@ type Conn struct {
 	readDeadline <-chan time.Time
 
 	lastActivity atomic.Pointer[time.Time]
-	// lastPongNanos tracks when the last connected pong was received,
+	// lastPongAt tracks when the last connected pong was received,
 	// used for adaptive dead connection detection (matches netty-raknet PongHandler).
-	lastPongNanos atomic.Int64
-	// firstActivityNanos tracks when the connection was first established
+	// Uses atomic.Pointer[time.Time] for monotonic-clock-safe elapsed calculation.
+	lastPongAt atomic.Pointer[time.Time]
+	// firstActivityAt tracks when the connection was first established
 	// (handlerAdded equivalent), used for initial grace period.
-	firstActivityNanos int64
+	// Uses time.Time for monotonic-clock-safe elapsed via time.Since.
+	firstActivityAt time.Time
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -162,11 +164,10 @@ func newConnWithLimits(conn net.PacketConn, addr net.Addr, mtuSize uint16, limit
 		buf:                bytes.NewBuffer(make([]byte, 0, mtuSize)),
 		ackBuf:             bytes.NewBuffer(make([]byte, 0, 256)),
 		nackBuf:            bytes.NewBuffer(make([]byte, 0, 256)),
-		firstActivityNanos: time.Now().UnixNano(),
+		firstActivityAt:    time.Now(),
 	}
 	t := time.Now()
 	c.lastActivity.Store(&t)
-	c.lastPongNanos.Store(0)
 	go c.startTicking()
 	return c
 }
@@ -229,12 +230,14 @@ func (conn *Conn) startTicking() {
 			conn.flushACKs()
 
 			// Adaptive ping: interval = max(50ms, min(RTT, 500ms)).
-			// Defaults to 200ms when RTT hasn't been measured yet.
-			// Matches netty-raknet PingProducer.scheduleNextPing.
-			rtt := conn.retransmission.rtt()
+			// Uses conn.rtt (atomic) to avoid concurrent map access on resendMap;
+			// rtt starts at 0 so defaultPingInterval (200ms) is used until the
+			// first RTT measurement from checkResend. Matches netty-raknet.
+			rttNanos := conn.rtt.Load()
 			pingInterval := defaultPingInterval
-			if rtt != 0 {
-				pingInterval = maxDuration(minPingInterval, minDuration(rtt, maxPingInterval))
+			if rttNanos != 0 {
+				rttDur := time.Duration(rttNanos)
+				pingInterval = maxDuration(minPingInterval, minDuration(rttDur, maxPingInterval))
 			}
 			if t.Sub(lastPingAt) >= pingInterval {
 				lastPingAt = t
@@ -250,20 +253,22 @@ func (conn *Conn) startTicking() {
 			// Replaces the old fixed 5s + 2*rtt floor with pure adaptive interval.
 			if i%10 == 0 {
 				conn.mu.Lock()
+				rttNanos := conn.rtt.Load()
 				pingInterval := defaultPingInterval
-				if rtt != 0 {
-					pingInterval = maxDuration(minPingInterval, minDuration(rtt, maxPingInterval))
+				if rttNanos != 0 {
+					rttDur := time.Duration(rttNanos)
+					pingInterval = maxDuration(minPingInterval, minDuration(rttDur, maxPingInterval))
 				}
-				lastPong := conn.lastPongNanos.Load()
+				lastPong := conn.lastPongAt.Load()
 				var elapsed time.Duration
 				var maxMissed int
-				if lastPong == 0 {
+				if lastPong == nil {
 					// No pong ever received — use connection start time with double grace.
 					// Matches netty-raknet referenceNanos = firstPingNanos, maxMissed = MAX_MISSED_PONGS * 2.
-					elapsed = time.Duration(time.Now().UnixNano() - conn.firstActivityNanos)
+					elapsed = time.Since(conn.firstActivityAt)
 					maxMissed = maxMissedPongs * 2
 				} else {
-					elapsed = time.Duration(time.Now().UnixNano() - lastPong)
+					elapsed = time.Since(*lastPong)
 					maxMissed = maxMissedPongs
 				}
 				deadline := pingInterval * time.Duration(maxMissed)
@@ -930,7 +935,7 @@ func (conn *Conn) handleConnectedPong(b *bytes.Buffer) error {
 	}
 	// Track last pong time for adaptive dead connection detection.
 	// Matches netty-raknet PongHandler.LAST_PONG_NANOS.
-	conn.lastPongNanos.Store(time.Now().UnixNano())
+	t := time.Now(); conn.lastPongAt.Store(&t)
 	// We don't actually use the ConnectedPong to measure rtt. It is too
 	// unreliable and doesn't give a good idea of the connection quality.
 	return nil
