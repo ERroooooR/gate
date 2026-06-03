@@ -2,6 +2,7 @@ package lite
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -132,4 +133,124 @@ func TestRaknetifyConnWriteWrapsMinecraftFrames(t *testing.T) {
 		{raknetifyGamePacketID, 0x01, 0x02},
 		{raknetifyGamePacketID, 0x03},
 	}, writePackets)
+}
+
+// ---------------------------------------------------------------------------
+// Write gate after detach (matches raknetify MixinClientConnection isClosing fix)
+// ---------------------------------------------------------------------------
+
+func TestRaknetifyConnWriteAfterDetachReturnsEOF(t *testing.T) {
+	raw := &fakeRaknetPacketConn{}
+	conn := newRaknetifyConn(raw).(*raknetifyConn)
+
+	// Detach the underlying frame connection.
+	conn.DetachFrameConn()
+
+	// Write should return io.EOF to prevent racing with the passthrough pipe.
+	n, err := conn.Write([]byte{0x01})
+	if n != 0 {
+		t.Fatalf("Write after detach returned n=%d, want 0", n)
+	}
+	if err != io.EOF {
+		t.Fatalf("Write after detach returned err=%v, want io.EOF", err)
+	}
+
+	// Verify no frames were written to the underlying connection.
+	if len(raw.writeFrames) != 0 {
+		t.Fatalf("Write after detach wrote %d frames, want 0", len(raw.writeFrames))
+	}
+}
+
+func TestRaknetifyConnWriteBeforeDetachSucceeds(t *testing.T) {
+	raw := &fakeRaknetPacketConn{}
+	conn := newRaknetifyConn(raw).(*raknetifyConn)
+
+	// Write a valid Minecraft packet: VarInt(1) + payload{0x00}.
+	// The Write method requires a Minecraft-style length-prefixed frame.
+	var stream bytes.Buffer
+	require.NoError(t, util.WriteVarInt(&stream, 1))
+	stream.WriteByte(0x00)
+
+	n, err := conn.Write(stream.Bytes())
+	if n != stream.Len() {
+		t.Fatalf("Write before detach returned n=%d, want %d", n, stream.Len())
+	}
+	if err != nil {
+		t.Fatalf("Write before detach returned err=%v, want nil", err)
+	}
+	if len(raw.writeFrames) != 1 {
+		t.Fatalf("Write before detach wrote %d frames, want 1", len(raw.writeFrames))
+	}
+}
+
+func TestRaknetifyConnReadAfterDetachReturnsEOF(t *testing.T) {
+	raw := &fakeRaknetPacketConn{
+		readFrames: []*raknet.Frame{
+			{Payload: []byte{raknetifyGamePacketID, 0x00}},
+		},
+	}
+	conn := newRaknetifyConn(raw).(*raknetifyConn)
+
+	conn.DetachFrameConn()
+
+	// Read should return io.EOF after detach (readAborted gate).
+	buf := make([]byte, 8)
+	n, err := conn.Read(buf)
+	if n != 0 {
+		t.Fatalf("Read after detach returned n=%d, want 0", n)
+	}
+	if err != io.EOF {
+		t.Fatalf("Read after detach returned err=%v, want io.EOF", err)
+	}
+}
+
+func TestRaknetifyConnCloseAfterDetachIsNoOp(t *testing.T) {
+	raw := &fakeRaknetPacketConn{}
+	conn := newRaknetifyConn(raw).(*raknetifyConn)
+
+	conn.DetachFrameConn()
+
+	// Close should be a no-op after detach — the underlying conn is preserved.
+	err := conn.Close()
+	if err != nil {
+		t.Fatalf("Close after detach returned err=%v, want nil", err)
+	}
+	// The underlying fake conn doesn't track closes, but the detached flag
+	// should prevent double-close issues on the real connection.
+	if !conn.detached {
+		t.Fatal("detached flag was not set by DetachFrameConn")
+	}
+}
+
+func TestRaknetifyConnDetachReturnsFrameConn(t *testing.T) {
+	raw := &fakeRaknetPacketConn{}
+	conn := newRaknetifyConn(raw).(*raknetifyConn)
+
+	fc := conn.DetachFrameConn()
+	if fc == nil {
+		t.Fatal("DetachFrameConn returned nil")
+	}
+	// The returned frame conn should be the original.
+	if fc != raw {
+		t.Fatal("DetachFrameConn did not return the original frame connection")
+	}
+}
+
+func TestRaknetifyConnDetachIsIdempotent(t *testing.T) {
+	raw := &fakeRaknetPacketConn{}
+	conn := newRaknetifyConn(raw).(*raknetifyConn)
+
+	fc1 := conn.DetachFrameConn()
+	fc2 := conn.DetachFrameConn()
+	if fc1 != fc2 {
+		t.Fatal("repeated DetachFrameConn returned different values")
+	}
+	if !conn.detached {
+		t.Fatal("detached flag was not set after DetachFrameConn")
+	}
+	// Write should still be blocked.
+	_, err := conn.Write([]byte{0x02})
+	if err != io.EOF {
+		t.Fatalf("Write after multiple detach calls returned err=%v, want io.EOF", err)
+	}
 }
