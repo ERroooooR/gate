@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.minekube.com/gate/pkg/edition/java/proto/util"
@@ -41,12 +42,12 @@ type raknetifyConn struct {
 	readBuf        bytes.Buffer
 	preRead        []*raknet.Frame
 	capturePreRead bool
-	readAborted    bool // set by DetachFrameConn to stop the read loop
+	readAborted    atomic.Bool // set by DetachFrameConn to stop the read loop
 
 	writeMu  sync.Mutex
 	writeBuf []byte
 
-	detached bool // set by DetachFrameConn so Close() leaves underlying conn alive
+	detached atomic.Bool // set by DetachFrameConn so Close() leaves underlying conn alive
 }
 
 func newRaknetifyConn(conn raknetFrameConn) net.Conn {
@@ -55,7 +56,7 @@ func newRaknetifyConn(conn raknetFrameConn) net.Conn {
 
 func (c *raknetifyConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
-	if c.readAborted {
+	if c.readAborted.Load() {
 		c.readMu.Unlock()
 		return 0, io.EOF
 	}
@@ -102,7 +103,7 @@ func (c *raknetifyConn) Write(p []byte) (int, error) {
 	// has been handed off to the passthrough pipe and writing here would
 	// race with copyFrames. Matches the !isClosing gate in raknetify's
 	// MixinClientConnection.redirectIsOpen.
-	if c.detached {
+	if c.detached.Load() {
 		return 0, io.EOF
 	}
 
@@ -152,7 +153,7 @@ func peekVarInt(buf []byte) (value int, bytesRead int, complete bool, err error)
 }
 
 func (c *raknetifyConn) Close() error {
-	if c.detached {
+	if c.detached.Load() {
 		return nil // underlying conn was detached, don't close it
 	}
 	return c.conn.Close()
@@ -185,11 +186,13 @@ func (c *raknetifyConn) FrameConn() raknetFrameConn {
 // DetachFrameConn stops the Minecraft read loop and returns the underlying
 // RakNet frame connection. After detach, Close() is a no-op and Read() returns
 // io.EOF, so the caller can take over the frame connection for passthrough.
+// Uses atomic stores so the detached and readAborted flags are visible to
+// Read, Write, and Close on all goroutines without additional synchronisation.
 func (c *raknetifyConn) DetachFrameConn() raknetFrameConn {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
-	c.detached = true
-	c.readAborted = true
+	c.detached.Store(true)
+	c.readAborted.Store(true)
 	return c.conn
 }
 

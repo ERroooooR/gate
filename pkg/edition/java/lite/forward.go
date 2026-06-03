@@ -150,6 +150,13 @@ func forwardRaknetifyPassthrough(
 			Info("failed to forward Raknetify passthrough connection")
 		return
 	}
+
+	// Snapshot the client context BEFORE any mutation (DetachFrameConn,
+	// DrainBufferedFrames, Close) so the backend dial always sees a valid,
+	// uncancelled context. Close() cancels client.Context(), so we must
+	// capture it first and strip the cancel signal with WithoutCancel.
+	clientCtx := client.Context()
+
 	src := srcConn.FrameConn()
 	var preReadFrames []*raknet.Frame
 	if buffered, ok := netmc.Assert[interface{ DrainBufferedFrames() []*raknet.Frame }](client); ok {
@@ -162,7 +169,6 @@ func forwardRaknetifyPassthrough(
 	if detachable, ok := netmc.Assert[interface{ DetachFrameConn() raknetFrameConn }](client); ok {
 		src = detachable.DetachFrameConn()
 	}
-	clientCtx := client.Context() // snapshot before Close cancels it
 	_ = client.Close() // stop the read loop, underlying conn is now detached
 
 	// context.WithoutCancel strips the cancel signal from the client context

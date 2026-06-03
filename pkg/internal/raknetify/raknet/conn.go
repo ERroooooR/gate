@@ -31,6 +31,18 @@ const (
 	// raknetify.fragmentTimeoutSecs default of 3 seconds.
 	fragmentTimeout = time.Second * 3
 
+	// reliableFragmentTimeout is the maximum time to keep incomplete reliable
+	// fragment builders before forcibly discarding them. This prevents unbounded
+	// memory growth from lost reliable fragments. Matches netty-raknet's
+	// raknetify.reliableFragmentTimeoutSecs default of 60 seconds; Gate uses
+	// 120 seconds as an extra safety margin since it sees traffic from both sides.
+	reliableFragmentTimeout = time.Second * 120
+
+	// maxPendingFragmentBytes is the maximum total bytes of incomplete fragment
+	// payloads across all active splits. Exceeding this limit triggers connection
+	// close. Matches netty-raknet's 4 MiB cap (FrameJoiner.MAX_PENDING_FRAGMENT_BYTES).
+	maxPendingFragmentBytes = 4 * 1024 * 1024 // 4 MiB
+
 	// ackFlushDelayNanos is the time-based ACK flush threshold (2ms), matching
 	// netty-raknet's ACK_FLUSH_DELAY_NANOS for lower latency ACKs.
 	ackFlushDelayNanos = 2_000_000 // 2ms
@@ -88,9 +100,10 @@ type Conn struct {
 	// splits is a map of slices indexed by split IDs. The length of each of the
 	// slices is equal to the split count, and packets are positioned in that
 	// slice indexed by the split index.
-	splits             map[uint16][][]byte
-	splitTimes         map[uint16]time.Time // tracks when each split was first created for timeout
-	splitReliabilities map[uint16]byte      // tracks reliability of each split for expiration
+	splits              map[uint16][][]byte
+	splitTimes          map[uint16]time.Time // tracks when each split was first created for timeout
+	splitReliabilities  map[uint16]byte      // tracks reliability of each split for expiration
+	pendingFragmentBytes int                 // total bytes of incomplete fragment payloads across all active splits
 
 	// win is an ordered queue used to track which datagrams were received and
 	// which datagrams were missing, so that we can send NACKs to request
@@ -372,28 +385,45 @@ func (conn *Conn) checkResend(now time.Time) {
 }
 
 // cleanupExpiredFragments removes incomplete split packet fragments that have
-// exceeded the fragment timeout. Matches netty-raknet FrameJoiner.cleanupExpired.
-// Reliable fragment builders are never expired while the channel is active —
-// all fragments are forced to reliable (Frame.java:166), and fragments from
-// already-ACKed FrameSets won't be retransmitted. Expiring the builder
-// prematurely causes permanent data loss for delayed fragments.
-// handlerRemoved/closeImmediately cleans up all pending builders on channel close.
+// exceeded their timeout. Matches netty-raknet FrameJoiner.cleanupExpired.
+// Unreliable fragments expire after fragmentTimeout (3s). Reliable fragments
+// expire after reliableFragmentTimeout (120s) to prevent unbounded memory
+// growth — unlike netty-raknet which relies on the channel close path for
+// reliable cleanup, Gate needs an explicit cap because connections can be
+// long-lived passthrough pipes.
+// handlerRemoved/closeImmediately also cleans up all pending builders on close.
 func (conn *Conn) cleanupExpiredFragments() {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
 	now := time.Now()
 	for splitID, startTime := range conn.splitTimes {
-		// Never expire reliable fragment builders while the connection is active.
-		if reliability, ok := conn.splitReliabilities[splitID]; ok && packetReliable(reliability) {
-			continue
+		reliability, hasReliability := conn.splitReliabilities[splitID]
+		isReliable := hasReliability && packetReliable(reliability)
+
+		var timeout time.Duration
+		if isReliable {
+			timeout = reliableFragmentTimeout
+		} else {
+			timeout = fragmentTimeout
 		}
-		if now.Sub(startTime) > fragmentTimeout {
-			delete(conn.splits, splitID)
-			delete(conn.splitTimes, splitID)
-			delete(conn.splitReliabilities, splitID)
+		if now.Sub(startTime) > timeout {
+			conn.releaseSplitLocked(splitID)
 		}
 	}
+}
+
+// releaseSplitLocked removes a single split entry and accounts for its pending
+// bytes. Must be called with conn.mu held.
+func (conn *Conn) releaseSplitLocked(splitID uint16) {
+	if fragments, ok := conn.splits[splitID]; ok {
+		for _, frag := range fragments {
+			conn.pendingFragmentBytes -= len(frag)
+		}
+	}
+	delete(conn.splits, splitID)
+	delete(conn.splitTimes, splitID)
+	delete(conn.splitReliabilities, splitID)
 }
 
 func maxDuration(a, b time.Duration) time.Duration {
@@ -1010,15 +1040,26 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	}
 	m, ok := conn.splits[p.splitID]
 	if !ok {
+		// Enforce pending fragment byte limit before creating a new split.
+		// Matches netty-raknet FrameJoiner MAX_PENDING_FRAGMENT_BYTES (4 MiB).
+		newBytes := conn.pendingFragmentBytes + len(p.content)
+		if newBytes > maxPendingFragmentBytes && conn.limits {
+			return fmt.Errorf("pending fragment bytes %d exceeds the maximum %d", newBytes, maxPendingFragmentBytes)
+		}
 		m = make([][]byte, p.splitCount)
 		conn.splits[p.splitID] = m
 		conn.splitTimes[p.splitID] = time.Now()             // track fragment timeout
 		conn.splitReliabilities[p.splitID] = p.reliability // track reliability for expiration
+		conn.pendingFragmentBytes += len(p.content)
 	}
 	if p.splitIndex > uint32(len(m)-1) {
 		// The split index was either negative or was bigger than the slice
 		// size, meaning the packet is invalid.
 		return fmt.Errorf("error handing split packet: split index %v is out of range (0 - %v)", p.splitIndex, len(m)-1)
+	}
+	if m[p.splitIndex] != nil {
+		// Duplicate fragment; don't double-count.
+		return nil
 	}
 	m[p.splitIndex] = p.content
 
@@ -1038,9 +1079,8 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 		content = append(content, fragment...)
 	}
 
-	delete(conn.splits, p.splitID)
-	delete(conn.splitTimes, p.splitID)
-	delete(conn.splitReliabilities, p.splitID)
+	// Release the split and account for bytes that are now consumed.
+	conn.releaseSplitLocked(p.splitID)
 
 	p.content = content
 	return conn.receivePacket(p)

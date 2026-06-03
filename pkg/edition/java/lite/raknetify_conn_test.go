@@ -217,7 +217,7 @@ func TestRaknetifyConnCloseAfterDetachIsNoOp(t *testing.T) {
 	}
 	// The underlying fake conn doesn't track closes, but the detached flag
 	// should prevent double-close issues on the real connection.
-	if !conn.detached {
+	if !conn.detached.Load() {
 		t.Fatal("detached flag was not set by DetachFrameConn")
 	}
 }
@@ -245,7 +245,7 @@ func TestRaknetifyConnDetachIsIdempotent(t *testing.T) {
 	if fc1 != fc2 {
 		t.Fatal("repeated DetachFrameConn returned different values")
 	}
-	if !conn.detached {
+	if !conn.detached.Load() {
 		t.Fatal("detached flag was not set after DetachFrameConn")
 	}
 	// Write should still be blocked.

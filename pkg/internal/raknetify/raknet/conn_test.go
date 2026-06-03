@@ -260,6 +260,136 @@ func TestLastActivityUpdatedOnReceiveOrQueue(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Reliable fragment timeout (prevents unbounded memory growth)
+// ---------------------------------------------------------------------------
+
+func TestCleanupExpiredFragmentsExpiresStaleReliable(t *testing.T) {
+	conn := makeTestConn()
+
+	// Reliable split older than reliableFragmentTimeout (120s) — should be expired.
+	// Fill with real fragment data so releaseSplitLocked can account for bytes.
+	conn.splitTimes[1] = time.Now().Add(-reliableFragmentTimeout - time.Second)
+	conn.splits[1] = [][]byte{
+		{0x01, 0x02, 0x03},
+		nil, // missing fragment
+		nil,
+	}
+	conn.splitReliabilities[1] = reliabilityReliableOrdered
+	conn.pendingFragmentBytes = 3
+
+	conn.cleanupExpiredFragments()
+
+	if _, ok := conn.splits[1]; ok {
+		t.Fatal("stale reliable split was not expired after reliableFragmentTimeout")
+	}
+	if conn.pendingFragmentBytes != 0 {
+		t.Fatalf("pendingFragmentBytes was not decremented: got %d, want 0", conn.pendingFragmentBytes)
+	}
+}
+
+func TestCleanupExpiredFragmentsKeepsRecentReliable(t *testing.T) {
+	conn := makeTestConn()
+
+	// Reliable split younger than reliableFragmentTimeout — should be preserved.
+	conn.splitTimes[1] = time.Now().Add(-reliableFragmentTimeout + time.Minute)
+	conn.splits[1] = [][]byte{{0x01, 0x02}, nil}
+	conn.splitReliabilities[1] = reliabilityReliableOrdered
+	conn.pendingFragmentBytes = 2
+
+	conn.cleanupExpiredFragments()
+
+	if _, ok := conn.splits[1]; !ok {
+		t.Fatal("recent reliable split was incorrectly expired")
+	}
+	if conn.pendingFragmentBytes != 2 {
+		t.Fatalf("pendingFragmentBytes was incorrectly modified: got %d", conn.pendingFragmentBytes)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pending fragment byte limit (4 MiB cap matching netty-raknet)
+// ---------------------------------------------------------------------------
+
+func TestReceiveSplitPacketEnforcesByteLimit(t *testing.T) {
+	conn := makeTestConn()
+	conn.limits = true // enable limits
+	conn.mtuSize = maxMTUSize
+
+	// Fill pending bytes up to just below the limit.
+	conn.pendingFragmentBytes = maxPendingFragmentBytes - 10
+
+	// A fragment larger than the remaining budget should be rejected.
+	pk := &packet{
+		reliability: reliabilityReliableOrdered,
+		split:       true,
+		splitCount:  2,
+		splitIndex:  0,
+		splitID:     1,
+		content:     make([]byte, 100), // exceeds remaining 10-byte budget
+	}
+	err := conn.receiveSplitPacket(pk)
+	if err == nil {
+		t.Fatal("expected error for exceeding pending fragment byte limit")
+	}
+}
+
+func TestReceiveSplitPacketAllowsUnderLimit(t *testing.T) {
+	conn := makeTestConn()
+	conn.limits = true
+	conn.mtuSize = maxMTUSize
+
+	conn.pendingFragmentBytes = maxPendingFragmentBytes - 1000
+
+	pk := &packet{
+		reliability: reliabilityReliableOrdered,
+		split:       true,
+		splitCount:  2,
+		splitIndex:  0,
+		splitID:     50,
+		content:     make([]byte, 100),
+	}
+	err := conn.receiveSplitPacket(pk)
+	if err != nil {
+		t.Fatalf("expected success for fragment under the byte limit: %v", err)
+	}
+	if conn.pendingFragmentBytes != maxPendingFragmentBytes-900 {
+		t.Fatalf("pendingFragmentBytes was not incremented: got %d", conn.pendingFragmentBytes)
+	}
+}
+
+func TestReleaseSplitLockedAccountsForBytes(t *testing.T) {
+	conn := makeTestConn()
+	conn.limits = true
+	conn.mtuSize = maxMTUSize
+
+	// Create a pending split with fragments.
+	pk0 := &packet{
+		reliability: reliabilityReliableOrdered,
+		split:       true,
+		splitCount:  2,
+		splitIndex:  0,
+		splitID:     99,
+		content:     []byte{0x01, 0x02, 0x03},
+	}
+	if err := conn.receiveSplitPacket(pk0); err != nil {
+		t.Fatalf("first fragment: %v", err)
+	}
+	before := conn.pendingFragmentBytes
+	if before != 3 {
+		t.Fatalf("pendingFragmentBytes after first fragment = %d, want 3", before)
+	}
+
+	// Release the split explicitly.
+	conn.releaseSplitLocked(99)
+	if conn.pendingFragmentBytes != 0 {
+		t.Fatalf("pendingFragmentBytes after release = %d, want 0", conn.pendingFragmentBytes)
+	}
+	if _, ok := conn.splits[99]; ok {
+		t.Fatal("split was not removed by releaseSplitLocked")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
