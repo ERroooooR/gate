@@ -98,6 +98,14 @@ func (c *raknetifyConn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
+	// Prevent writes on a detached connection — the underlying frame conn
+	// has been handed off to the passthrough pipe and writing here would
+	// race with copyFrames. Matches the !isClosing gate in raknetify's
+	// MixinClientConnection.redirectIsOpen.
+	if c.detached {
+		return 0, io.EOF
+	}
+
 	c.writeBuf = append(c.writeBuf, p...)
 	consumed := 0
 	for {

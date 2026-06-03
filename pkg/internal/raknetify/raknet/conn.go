@@ -88,8 +88,9 @@ type Conn struct {
 	// splits is a map of slices indexed by split IDs. The length of each of the
 	// slices is equal to the split count, and packets are positioned in that
 	// slice indexed by the split index.
-	splits      map[uint16][][]byte
-	splitTimes  map[uint16]time.Time // tracks when each split was first created for timeout
+	splits             map[uint16][][]byte
+	splitTimes         map[uint16]time.Time // tracks when each split was first created for timeout
+	splitReliabilities map[uint16]byte      // tracks reliability of each split for expiration
 
 	// win is an ordered queue used to track which datagrams were received and
 	// which datagrams were missing, so that we can send NACKs to request
@@ -159,6 +160,7 @@ func newConnWithLimits(conn net.PacketConn, addr net.Addr, mtuSize uint16, limit
 		packets:            make(chan *Frame, 512),
 		splits:             make(map[uint16][][]byte),
 		splitTimes:         make(map[uint16]time.Time),
+		splitReliabilities: make(map[uint16]byte),
 		win:                newDatagramWindow(),
 		retransmission:     newRecoveryQueue(),
 		buf:                bytes.NewBuffer(make([]byte, 0, mtuSize)),
@@ -371,15 +373,25 @@ func (conn *Conn) checkResend(now time.Time) {
 
 // cleanupExpiredFragments removes incomplete split packet fragments that have
 // exceeded the fragment timeout. Matches netty-raknet FrameJoiner.cleanupExpired.
+// Reliable fragment builders are never expired while the channel is active —
+// all fragments are forced to reliable (Frame.java:166), and fragments from
+// already-ACKed FrameSets won't be retransmitted. Expiring the builder
+// prematurely causes permanent data loss for delayed fragments.
+// handlerRemoved/closeImmediately cleans up all pending builders on channel close.
 func (conn *Conn) cleanupExpiredFragments() {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
 	now := time.Now()
 	for splitID, startTime := range conn.splitTimes {
+		// Never expire reliable fragment builders while the connection is active.
+		if reliability, ok := conn.splitReliabilities[splitID]; ok && packetReliable(reliability) {
+			continue
+		}
 		if now.Sub(startTime) > fragmentTimeout {
 			delete(conn.splits, splitID)
 			delete(conn.splitTimes, splitID)
+			delete(conn.splitReliabilities, splitID)
 		}
 	}
 }
@@ -1000,7 +1012,8 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	if !ok {
 		m = make([][]byte, p.splitCount)
 		conn.splits[p.splitID] = m
-		conn.splitTimes[p.splitID] = time.Now() // track fragment timeout
+		conn.splitTimes[p.splitID] = time.Now()             // track fragment timeout
+		conn.splitReliabilities[p.splitID] = p.reliability // track reliability for expiration
 	}
 	if p.splitIndex > uint32(len(m)-1) {
 		// The split index was either negative or was bigger than the slice
@@ -1027,6 +1040,7 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 
 	delete(conn.splits, p.splitID)
 	delete(conn.splitTimes, p.splitID)
+	delete(conn.splitReliabilities, p.splitID)
 
 	p.content = content
 	return conn.receivePacket(p)
@@ -1073,6 +1087,13 @@ func (conn *Conn) sendAcknowledgement(packets []uint24, bitflag byte, buf *bytes
 // connection. These mean that a datagram was successfully received by the
 // other end.
 func (conn *Conn) handleACK(b *bytes.Buffer) error {
+	// Any inbound data (ACK, NACK, or FrameSet) proves the connection is alive.
+	// This covers the case where only ACKs/NACKs are being received while
+	// Pongs and application FrameSets are lost — without this, the peer
+	// could be falsely detected as dead despite continuous bidirectional traffic.
+	// Matches netty-raknet ReliabilityHandler.channelRead.
+	t := time.Now(); conn.lastPongAt.Store(&t)
+
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
@@ -1096,6 +1117,10 @@ func (conn *Conn) handleACK(b *bytes.Buffer) error {
 // handleNACK handles a negative acknowledgment packet from the other end of
 // the connection. These mean that a datagram was found missing.
 func (conn *Conn) handleNACK(b *bytes.Buffer) error {
+	// Any inbound data (ACK, NACK, or FrameSet) proves the connection is alive.
+	// Matches netty-raknet ReliabilityHandler.channelRead.
+	t := time.Now(); conn.lastPongAt.Store(&t)
+
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
