@@ -210,7 +210,7 @@ func TestRaknetifyConnCloseAfterDetachIsNoOp(t *testing.T) {
 
 	conn.DetachFrameConn()
 
-	// Close should be a no-op after detach — the underlying conn is preserved.
+	// Close should be a no-op after detach —the underlying conn is preserved.
 	err := conn.Close()
 	if err != nil {
 		t.Fatalf("Close after detach returned err=%v, want nil", err)
@@ -252,5 +252,64 @@ func TestRaknetifyConnDetachIsIdempotent(t *testing.T) {
 	_, err := conn.Write([]byte{0x02})
 	if err != io.EOF {
 		t.Fatalf("Write after multiple detach calls returned err=%v, want io.EOF", err)
+	}
+}
+
+// TestRaknetifyConnConcurrentWriteDetach verifies that concurrent Write and
+// DetachFrameConn do not race. The detached flag (atomic.Bool) is read under
+// writeMu in Write and written under readMu in DetachFrameConn - different
+// locks - so both the atomic store/load AND correct happens-before ordering
+// are required for correctness. Run with -race.
+func TestRaknetifyConnConcurrentWriteDetach(t *testing.T) {
+	raw := &fakeRaknetPacketConn{}
+	conn := newRaknetifyConn(raw).(*raknetifyConn)
+
+	// Build a valid Minecraft packet: VarInt(1) + payload{0x00}.
+	var stream bytes.Buffer
+	require.NoError(t, util.WriteVarInt(&stream, 1))
+	stream.WriteByte(0x00)
+	pkt := stream.Bytes()
+
+	var writesOK, writesEOF int
+	done := make(chan struct{})
+
+	// Goroutine 1: write repeatedly until detach cuts us off.
+	go func() {
+		defer close(done)
+		for {
+			_, err := conn.Write(pkt)
+			if err == nil {
+				writesOK++
+			} else if err == io.EOF {
+				writesEOF++
+				return
+			} else {
+				t.Errorf("unexpected write error: %v", err)
+				return
+			}
+		}
+	}()
+
+	// Goroutine 2: detach after a brief moment to ensure some writes have landed.
+	time.Sleep(5 * time.Millisecond)
+	fc := conn.DetachFrameConn()
+	if fc == nil {
+		t.Fatal("DetachFrameConn returned nil")
+	}
+
+	<-done
+
+	// At least one write should have succeeded before detach.
+	if writesOK == 0 {
+		t.Fatal("no writes succeeded before detach")
+	}
+	// At least one write should have returned io.EOF after detach.
+	if writesEOF == 0 {
+		t.Fatal("no writes returned io.EOF after detach")
+	}
+
+	// Verify the underlying connection received exactly the successful writes.
+	if len(raw.writeFrames) != writesOK {
+		t.Fatalf("underlying writeFrames = %d, want %d (writesOK)", len(raw.writeFrames), writesOK)
 	}
 }

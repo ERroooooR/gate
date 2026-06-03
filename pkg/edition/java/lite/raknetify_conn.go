@@ -99,7 +99,7 @@ func (c *raknetifyConn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	// Prevent writes on a detached connection — the underlying frame conn
+	// Prevent writes on a detached connection —the underlying frame conn
 	// has been handed off to the passthrough pipe and writing here would
 	// race with copyFrames. Matches the !isClosing gate in raknetify's
 	// MixinClientConnection.redirectIsOpen.
@@ -153,6 +153,13 @@ func peekVarInt(buf []byte) (value int, bytesRead int, complete bool, err error)
 }
 
 func (c *raknetifyConn) Close() error {
+	// Acquire writeMu to serialize with DetachFrameConn and Write.
+	// Prevents racing: Close reads detached=false, DetachFrameConn sets
+	// detached=true and hands off conn, then Close calls c.conn.Close()
+	// on the already-transferred connection.
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	if c.detached.Load() {
 		return nil // underlying conn was detached, don't close it
 	}
@@ -186,13 +193,23 @@ func (c *raknetifyConn) FrameConn() raknetFrameConn {
 // DetachFrameConn stops the Minecraft read loop and returns the underlying
 // RakNet frame connection. After detach, Close() is a no-op and Read() returns
 // io.EOF, so the caller can take over the frame connection for passthrough.
-// Uses atomic stores so the detached and readAborted flags are visible to
-// Read, Write, and Close on all goroutines without additional synchronisation.
+//
+// Acquires both readMu and writeMu: readMu stops new Reads, writeMu drains
+// any in-flight Write before the handoff. This guarantees that by the time
+// this method returns, no Read, Write, or Close on this raknetifyConn will
+// touch the underlying connection — it belongs exclusively to the caller.
 func (c *raknetifyConn) DetachFrameConn() raknetFrameConn {
 	c.readMu.Lock()
-	defer c.readMu.Unlock()
 	c.detached.Store(true)
 	c.readAborted.Store(true)
+	c.readMu.Unlock()
+
+	// Drain in-flight writes: a Write may have passed the detached check
+	// before we set the flag. Holding writeMu ensures it has completed
+	// (or will see detached=true and return io.EOF) before we return.
+	c.writeMu.Lock()
+	c.writeMu.Unlock()
+
 	return c.conn
 }
 

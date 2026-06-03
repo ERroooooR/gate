@@ -25,10 +25,12 @@ func makeTestConn() *Conn {
 }
 
 // makeSinglePacketACK constructs a valid ACK buffer containing a single packet
-// with the given sequence number.
+// with the given sequence number. The buffer does NOT include the datagram header
+// byte (bitFlagACK|bitFlagDatagram) — receive() already consumes it before
+// dispatching to handleACK. Use makeDatagramACK for tests that go through
+// receive/receiveOrQueue.
 func makeSinglePacketACK(seq uint24) *bytes.Buffer {
 	buf := bytes.NewBuffer(nil)
-	buf.WriteByte(bitFlagACK | bitFlagDatagram)          // 0xC0
 	_ = binary.Write(buf, binary.BigEndian, int16(1))     // record count = 1
 	buf.WriteByte(packetSingle)                           // single packet type
 	writeUint24(buf, seq)                                 // sequence number
@@ -36,10 +38,22 @@ func makeSinglePacketACK(seq uint24) *bytes.Buffer {
 }
 
 // makeSinglePacketNACK constructs a valid NACK buffer containing a single packet
-// with the given sequence number.
+// with the given sequence number. The buffer does NOT include the datagram header
+// byte (bitFlagNACK|bitFlagDatagram) — receive() already consumes it before
+// dispatching to handleNACK.
 func makeSinglePacketNACK(seq uint24) *bytes.Buffer {
 	buf := bytes.NewBuffer(nil)
-	buf.WriteByte(bitFlagNACK | bitFlagDatagram)          // 0xA0
+	_ = binary.Write(buf, binary.BigEndian, int16(1))     // record count = 1
+	buf.WriteByte(packetSingle)                           // single packet type
+	writeUint24(buf, seq)                                 // sequence number
+	return buf
+}
+
+// makeDatagramACK constructs a buffer with the full datagram header
+// (bitFlagACK|bitFlagDatagram) for tests that go through receive/receiveOrQueue.
+func makeDatagramACK(seq uint24) *bytes.Buffer {
+	buf := bytes.NewBuffer(nil)
+	buf.WriteByte(bitFlagACK | bitFlagDatagram)           // 0xC0
 	_ = binary.Write(buf, binary.BigEndian, int16(1))     // record count = 1
 	buf.WriteByte(packetSingle)                           // single packet type
 	writeUint24(buf, seq)                                 // sequence number
@@ -189,11 +203,10 @@ func TestHandleNACKUpdatesLastPongAt(t *testing.T) {
 	conn.lastPongAt.Store(nil)
 	time.Sleep(time.Millisecond)
 
-	// NACK requires the sequence number to exist in retransmission for resend.
-	// Pre-populate retransmission with a packet at seq 0 so resend doesn't fail.
-	pk := &packet{reliability: reliabilityReliableOrdered, content: []byte{0x00}}
-	conn.retransmission.add(0, pk)
-
+	// handleNACK updates lastPongAt at entry and then parses the NACK buffer.
+	// We send a NACK for seq 0 which doesn't exist in retransmission — resend
+	// will skip it without writing to the wire. This tests that ACK/NACK liveness
+	// works even when the NACK'd packet is already gone (e.g. acked by another path).
 	err := conn.handleNACK(makeSinglePacketNACK(0))
 	if err != nil {
 		t.Fatalf("handleNACK returned error: %v", err)
@@ -246,7 +259,8 @@ func TestLastActivityUpdatedOnReceiveOrQueue(t *testing.T) {
 	time.Sleep(time.Millisecond)
 
 	// receiveOrQueue with nil receiveQueue calls receive directly.
-	err := conn.receiveOrQueue(makeSinglePacketACK(0))
+	// receive needs the full datagram header, so use makeDatagramACK.
+	err := conn.receiveOrQueue(makeDatagramACK(0))
 	if err != nil {
 		t.Fatalf("receiveOrQueue returned error: %v", err)
 	}
@@ -407,17 +421,35 @@ func requireNotNil(t *testing.T, v *time.Time) {
 func TestResendPreservesRetryCountAcrossRetransmits(t *testing.T) {
 	conn := makeTestConn()
 
-	// Add a packet with an initial retry count.
+	// Add a packet with an initial retry count of 2 (simulating a packet that
+	// has already been retransmitted twice).
 	pk := &packet{reliability: reliabilityReliableOrdered, content: []byte{0x01}}
 	conn.retransmission.addWithRetryCount(0, pk, 2)
 
-	// Verify the retry count was preserved.
-	record, ok := conn.retransmission.unacknowledged[0]
+	// Simulate the resend flow: retransmit increments retryCount and removes
+	// the old entry, then addWithRetryCount preserves it under the new
+	// sequence number. This is the exact pattern used by conn.resend().
+	pk2, retryCount, ok := conn.retransmission.retransmit(0)
 	if !ok {
-		t.Fatal("packet not found in retransmission map")
+		t.Fatal("retransmit did not find the packet")
 	}
-	if record.retryCount != 2 {
-		t.Fatalf("retryCount = %d, want 2", record.retryCount)
+	if retryCount != 3 {
+		t.Fatalf("retryCount after retransmit = %d, want 3 (2 + 1)", retryCount)
+	}
+
+	// Verify the old entry was removed.
+	if _, ok := conn.retransmission.unacknowledged[0]; ok {
+		t.Fatal("old sequence number was not removed by retransmit")
+	}
+
+	// Re-add under a new sequence number (as resend does after writing to the wire).
+	conn.retransmission.addWithRetryCount(100, pk2, retryCount)
+	record, ok := conn.retransmission.unacknowledged[100]
+	if !ok {
+		t.Fatal("packet not found under new sequence number after re-add")
+	}
+	if record.retryCount != 3 {
+		t.Fatalf("retryCount after re-add = %d, want 3", record.retryCount)
 	}
 }
 
@@ -434,9 +466,17 @@ func TestHasRTTDefaultFalse(t *testing.T) {
 
 func TestHasRTTSetTrue(t *testing.T) {
 	conn := makeTestConn()
-	conn.hasRTT.Store(true)
+
+	// hasRTT must be set by handleACK when a real packet is acknowledged,
+	// not by external callers. The resendMap records a delay sample when
+	// acknowledge succeeds, giving a genuine RTT measurement.
+	pk := &packet{reliability: reliabilityReliableOrdered, content: []byte{0x01}}
+	conn.retransmission.add(0, pk)
+	if err := conn.handleACK(makeSinglePacketACK(0)); err != nil {
+		t.Fatalf("handleACK returned error: %v", err)
+	}
 	if !conn.hasRTT.Load() {
-		t.Fatal("hasRTT should be true after Store(true)")
+		t.Fatal("hasRTT should be true after handleACK acknowledges a packet")
 	}
 }
 
