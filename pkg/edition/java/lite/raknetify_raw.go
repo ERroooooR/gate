@@ -34,7 +34,7 @@ const (
 	rawRaknetifyWriteTimeout      = 10 * time.Millisecond
 	rawRaknetifyPacingInterval    = 0
 	rawRaknetifyMaxPacingInterval = 100 * time.Millisecond
-	rawRaknetifyBackendQueueSize  = 256
+	rawRaknetifyBackendQueueSize  = 16
 )
 
 var rawRaknetifyRouteHintMagic = []byte("GATE_RAKNET_ROUTE")
@@ -397,6 +397,11 @@ func setRawRaknetifyUDPQoS(log logr.Logger, name string, conn *net.UDPConn, tos 
 }
 
 func (s *rawRaknetifyServer) writeToBackend(session *rawRaknetifySession, packet []byte) error {
+	clientAddr := session.currentClientAddr()
+	if err := session.backendConn.SetWriteDeadline(time.Now().Add(session.options.writeTimeout)); err != nil {
+		rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "deadline_error")
+		s.log.V(1).Info("failed to set raw raknetify backend write deadline", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "timeout", session.options.writeTimeout, "error", err)
+	}
 	_, err := session.backendConn.Write(packet)
 	return err
 }
