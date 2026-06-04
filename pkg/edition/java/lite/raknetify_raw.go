@@ -39,6 +39,15 @@ const (
 
 var rawRaknetifyRouteHintMagic = []byte("GATE_RAKNET_ROUTE")
 
+// rawRaknetifyPacketPool reuses packet byte slices to reduce GC pressure
+// from per-packet copies in enqueueToBackend.
+var rawRaknetifyPacketPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 1500)
+		return &b
+	},
+}
+
 type rawRaknetifySession struct {
 	host        string
 	routeToken  string
@@ -47,7 +56,7 @@ type rawRaknetifySession struct {
 	backendAddr *net.UDPAddr
 	backendConn *net.UDPConn
 	options     rawRaknetifyRouteOptions
-	toBackend   chan []byte
+	toBackend   chan *[]byte
 	decrement   func()
 	lastSeen    atomic.Int64
 	closeOnce   sync.Once
@@ -128,18 +137,27 @@ func (s *rawRaknetifySession) enqueueToBackend(packet []byte) bool {
 	}
 	s.queueMu.RUnlock()
 
-	copied := make([]byte, len(packet))
-	copy(copied, packet)
+	bp := rawRaknetifyPacketPool.Get().(*[]byte)
+	b := *bp
+	if cap(b) < len(packet) {
+		b = make([]byte, len(packet))
+		*bp = b
+	} else {
+		b = b[:len(packet)]
+	}
+	copy(b, packet)
 
 	s.queueMu.RLock()
 	defer s.queueMu.RUnlock()
 	if s.closed {
+		rawRaknetifyPacketPool.Put(bp)
 		return false
 	}
 	select {
-	case s.toBackend <- copied:
+	case s.toBackend <- bp:
 		return true
 	default:
+		rawRaknetifyPacketPool.Put(bp)
 		return false
 	}
 }
@@ -302,7 +320,7 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 		backendAddr: backendAddr,
 		backendConn: backendConn,
 		options:     options,
-		toBackend:   make(chan []byte, options.queueSize),
+		toBackend:   make(chan *[]byte, options.queueSize),
 		clientAddr:  clientAddr,
 		clientKey:   key,
 	}
@@ -457,7 +475,8 @@ func (s *rawRaknetifyServer) resolveBackend(host string, clientAddr net.Addr) (*
 
 func (s *rawRaknetifyServer) copyClientToBackend(session *rawRaknetifySession) {
 	var nextWrite time.Time
-	for packet := range session.toBackend {
+	for bp := range session.toBackend {
+		packet := *bp
 		nextWrite = paceRawRaknetifyWrite(nextWrite, session.options.pacingInterval)
 		session.touch(time.Now())
 		if err := s.writeToBackend(session, packet); err != nil {
@@ -466,6 +485,7 @@ func (s *rawRaknetifyServer) copyClientToBackend(session *rawRaknetifySession) {
 				rawRaknetifyMetrics.recordDroppedPacket("client_to_backend", "write_timeout")
 				rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "timeout")
 				s.log.V(1).Info("dropping raw raknetify packet after backend write timed out", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
+				rawRaknetifyPacketPool.Put(bp)
 				continue
 			}
 			rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "error")
@@ -473,6 +493,7 @@ func (s *rawRaknetifyServer) copyClientToBackend(session *rawRaknetifySession) {
 			s.closeSession(session, "backend_write_error")
 			return
 		}
+		rawRaknetifyPacketPool.Put(bp)
 	}
 }
 
