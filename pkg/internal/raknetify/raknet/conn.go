@@ -217,9 +217,10 @@ func newConnWithLimits(conn net.PacketConn, addr net.Addr, mtuSize uint16, limit
 // out.
 func (conn *Conn) startTicking() {
 	var (
-		ticker   = time.NewTicker(tickInterval)
-		i        int64
-		acksLeft int
+		ticker    = time.NewTicker(tickInterval)
+		i         int64
+		acksLeft  int
+		lastPing  time.Time
 	)
 	defer ticker.Stop()
 	for {
@@ -234,9 +235,9 @@ func (conn *Conn) startTicking() {
 				rtt = defaultPingInterval
 			}
 			interval := maxDuration(minDuration(rtt, maxPingInterval), minPingInterval)
-			_ = interval
-			if i%2 == 0 {
+			if time.Since(lastPing) >= interval {
 				conn.sendPing()
+				lastPing = t
 			}
 			if i%3 == 0 {
 				conn.checkResend(t)
@@ -748,14 +749,15 @@ func (conn *Conn) receivePacket(packet *packet) error {
 	}
 
 	isReliable := packetReliable(packet.reliability)
-	var ok bool
 	if isReliable {
-		ok = queue.put(packet.orderIndex, packet.frame())
+		if !queue.put(packet.orderIndex, packet.frame()) {
+			return nil
+		}
 	} else {
 		// Unreliable ordered/sequenced: track gap timeout to prevent indefinite
 		// head-of-line blocking. Matches netty-raknet FrameOrderIn gap timeout.
-		ok = queue.putUnreliable(packet.orderIndex, packet.frame())
-		if !ok {
+		inserted, _ := queue.putUnreliable(packet.orderIndex, packet.frame())
+		if !inserted {
 			return nil
 		}
 		// Gate: use 2x RTT as gap timeout (one retransmission cycle).
@@ -770,10 +772,6 @@ func (conn *Conn) receivePacket(packet *packet) error {
 				}
 			}
 		}
-	}
-	if !ok {
-		// An ordered packet arrived twice.
-		return nil
 	}
 	if queue.WindowSize() > maxWindowSize && conn.limits {
 		return fmt.Errorf("packet queue window size is too big on channel %v (%v-%v)", packet.orderChannel, queue.lowest, queue.highest)
@@ -900,7 +898,7 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	if p.splitCount <= 0 || p.splitCount > maxFragmentComponents {
 		return fmt.Errorf("invalid split count %v (max %v)", p.splitCount, maxFragmentComponents)
 	}
-	if p.splitIndex < 0 || p.splitIndex >= p.splitCount {
+	if p.splitIndex >= p.splitCount {
 		return fmt.Errorf("split index %v out of range [0, %v)", p.splitIndex, p.splitCount)
 	}
 	if uint64(p.splitCount)*uint64(maxMTUSize) > maxPendingFragmentBytes {
@@ -919,13 +917,12 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 		}
 	}()
 
-	// Enforce pending builder count limit.
-	if conn.limits && len(conn.splits) >= maxPendingBuilders {
-		return fmt.Errorf("pending fragment builders exceeded: %d >= %d", len(conn.splits), maxPendingBuilders)
-	}
-
 	m, ok := conn.splits[p.splitID]
 	if !ok {
+		// Enforce pending builder count limit only for new splits.
+		if conn.limits && len(conn.splits) >= maxPendingBuilders {
+			return fmt.Errorf("pending fragment builders exceeded: %d >= %d", len(conn.splits), maxPendingBuilders)
+		}
 		capped := p.splitCount
 		if capped > maxFragmentComponents {
 			capped = maxFragmentComponents
@@ -1045,7 +1042,7 @@ func (conn *Conn) receiveOrQueue(b *bytes.Buffer) error {
 // receiveQueue and calls receive(), used by Gate for ordered message processing.
 func (conn *Conn) startQueuedReceiver() {
 	if conn.receiveQueue == nil {
-		return
+		conn.receiveQueue = make(chan []byte, 512)
 	}
 	go func() {
 		for {
@@ -1193,21 +1190,27 @@ func (conn *Conn) requestConnection(id int64) error {
 // receive queue.
 var queuedDatagramPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 0, maxMTUSize)
+		b := make([]byte, 0, maxMTUSize)
+		return &b
 	},
 }
 
 // copyQueuedDatagram copies a datagram's bytes into a pooled buffer for queuing.
 func copyQueuedDatagram(b []byte) []byte {
-	dst := queuedDatagramPool.Get().([]byte)
-	dst = dst[:len(b)]
+	dstp := queuedDatagramPool.Get().(*[]byte)
+	dst := *dstp
+	if cap(dst) < len(b) {
+		dst = make([]byte, len(b))
+	} else {
+		dst = dst[:len(b)]
+	}
 	copy(dst, b)
 	return dst
 }
 
 // releaseQueuedDatagram returns a queued datagram buffer to the pool.
 func releaseQueuedDatagram(b []byte) {
-	queuedDatagramPool.Put(b[:0])
+	queuedDatagramPool.Put(&b)
 }
 
 // maxDuration returns the larger of a and b.

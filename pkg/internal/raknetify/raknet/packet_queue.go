@@ -35,16 +35,18 @@ func (queue *packetQueue) put(index uint24, packet *Frame) bool {
 }
 
 // putUnreliable puts a value at the index passed, tracking gap timeout for
-// unreliable frames. Returns isFirstInGap=true when a new gap is detected.
-func (queue *packetQueue) putUnreliable(index uint24, packet *Frame) (isFirstInGap bool) {
+// unreliable frames. Returns (inserted, isFirstInGap).
+// inserted=false means the index was already occupied or below lowest.
+// isFirstInGap=true means this insert created a new gap.
+func (queue *packetQueue) putUnreliable(index uint24, packet *Frame) (inserted bool, isFirstInGap bool) {
 	if !queue.put(index, packet) {
-		return false
+		return false, false
 	}
-	if int(index)-int(queue.lowest) > 1 && queue.gapStart.IsZero() {
+	if index > queue.lowest && queue.gapStart.IsZero() {
 		queue.gapStart = time.Now()
-		return true
+		return true, true
 	}
-	return false
+	return true, false
 }
 
 // gapSince returns the duration since the gap was first detected.

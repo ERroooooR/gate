@@ -208,6 +208,7 @@ func (c *raknetifyConn) DetachFrameConn() raknetFrameConn {
 	// before we set the flag. Holding writeMu ensures it has completed
 	// (or will see detached=true and return io.EOF) before we return.
 	c.writeMu.Lock()
+	_ = c.detached.Load()
 	c.writeMu.Unlock()
 
 	return c.conn
