@@ -34,6 +34,14 @@ const (
 	// Matches netty-raknet FrameJoiner maxPendingFragmentBytes.
 	maxPendingFragmentBytes = 4 * 1024 * 1024
 
+	// maxFragmentComponents caps the split count of a fragmented packet.
+	// Matches netty-raknet FrameJoiner MAX_FRAGMENT_COMPONENTS.
+	maxFragmentComponents = 16384
+
+	// maxPendingBuilders caps the number of incomplete fragmented packet builders.
+	// Matches netty-raknet FrameJoiner DEFAULT_MAX_PENDING_BUILDERS.
+	maxPendingBuilders = 256
+
 	// defaultPingInterval is the default ping interval used when RTT hasn't been measured yet.
 	defaultPingInterval = time.Millisecond * 200
 
@@ -51,6 +59,10 @@ const (
 
 	// raknetifyRetryDelay is a small constant delay added to the retry timeout.
 	raknetifyRetryDelay = time.Millisecond * 10
+
+	// ackFlushDelay is the delay before a deferred ACK flush fires.
+	// Matches netty-raknet ACK_FLUSH_DELAY_NANOS (2ms + 0.5ms grace).
+	ackFlushDelay = 2500 * time.Microsecond
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -132,6 +144,10 @@ type Conn struct {
 	// only ACK/NACK traffic (no pongs) stay alive.
 	lastPongAt atomic.Pointer[time.Time]
 
+	// hasPong is set true when the first pong is received. Used to double the
+	// initial dead-detection grace period before any pong arrives.
+	hasPong atomic.Bool
+
 	// splitReliabilities tracks the reliability of each pending split by its
 	// split ID. Used by cleanupExpiredFragments to apply different timeouts
 	// for reliable vs unreliable fragments.
@@ -148,6 +164,7 @@ type Conn struct {
 	firstActivityAt time.Time
 
 	// ackFlushTimer holds a timer for deferred ACK flushing.
+	// When non-nil, a deferred ACK flush is scheduled.
 	ackFlushTimer *time.Timer
 
 	// receiveQueue is an optional buffered channel for queuing inbound datagrams
@@ -230,7 +247,17 @@ func (conn *Conn) startTicking() {
 			}
 			if i%5 == 0 {
 				// Dead connection detection: check both lastPongAt and lastActivity.
-				missedPongDeadline := time.Duration(maxMissedPongs) * maxDuration(time.Duration(conn.rtt.Load()), defaultPingInterval)
+				// Floor effective interval to defaultPingInterval (200ms) so dead
+				// detection is never more aggressive than 200ms * maxMissed, matching
+				// netty-raknet PingProducer DEFAULT_INTERVAL_MILLIS floor.
+				effectiveInterval := maxDuration(time.Duration(conn.rtt.Load()), defaultPingInterval)
+				multiplier := time.Duration(maxMissedPongs)
+				if !conn.hasPong.Load() {
+					// No pong received yet: double the grace period (2x maxMissedPongs),
+					// matching netty-raknet firstPingNanos path.
+					multiplier *= 2
+				}
+				missedPongDeadline := multiplier * effectiveInterval
 				lastPong := conn.lastPongAt.Load()
 				lastActivity := conn.lastActivity.Load()
 				now := time.Now()
@@ -266,6 +293,11 @@ func (conn *Conn) flushACKs() {
 	conn.ackMu.Lock()
 	defer conn.ackMu.Unlock()
 
+	if conn.ackFlushTimer != nil {
+		conn.ackFlushTimer.Stop()
+		conn.ackFlushTimer = nil
+	}
+
 	if len(conn.ackSlice) > 0 {
 		// Write an ACK packet to the connection containing all datagram
 		// sequence numbers that we received since the last tick.
@@ -274,6 +306,18 @@ func (conn *Conn) flushACKs() {
 		}
 		conn.ackSlice = conn.ackSlice[:0]
 	}
+}
+
+// scheduleDeferredACKFlush schedules a one-shot timer to flush pending ACKs
+// after ackFlushDelay. This ensures low-traffic connections don't have to wait
+// for the full 50ms tick before the peer receives ACKs.
+func (conn *Conn) scheduleDeferredACKFlush() {
+	if conn.ackFlushTimer != nil {
+		conn.ackFlushTimer.Stop()
+	}
+	conn.ackFlushTimer = time.AfterFunc(ackFlushDelay, func() {
+		conn.flushACKs()
+	})
 }
 
 // checkResend checks if the connection needs to resend any packets. It sends
@@ -639,9 +683,13 @@ func (conn *Conn) receiveDatagram(b *bytes.Buffer) error {
 		return fmt.Errorf("error reading datagram sequence number: %v", err)
 	}
 	conn.ackMu.Lock()
+	wasEmpty := len(conn.ackSlice) == 0
 	// Add this sequence number to the received datagrams, so that it is
 	// included in an ACK.
 	conn.ackSlice = append(conn.ackSlice, seq)
+	if wasEmpty && len(conn.ackSlice) > 0 {
+		conn.scheduleDeferredACKFlush()
+	}
 	conn.ackMu.Unlock()
 
 	if !conn.win.new(seq) {
@@ -686,10 +734,11 @@ func (conn *Conn) handleDatagram(b *bytes.Buffer) error {
 
 // receivePacket handles the receiving of a packet. It puts the packet in the
 // queue and takes out all packets that were obtainable after that, and handles
-// them.
+// them. Unreliable ordered/sequenced packets use gap timeout to unblock
+// head-of-line when missing datagrams are not retransmitted.
 func (conn *Conn) receivePacket(packet *packet) error {
-	if packet.reliability != reliabilityReliableOrdered {
-		// If it isn't a reliable ordered packet, handle it immediately.
+	needsOrder := packetNeedsOrderIndex(packet.reliability)
+	if !needsOrder {
 		return conn.handleFrame(packet.frame())
 	}
 	queue := conn.packetQueues[packet.orderChannel]
@@ -697,7 +746,32 @@ func (conn *Conn) receivePacket(packet *packet) error {
 		queue = newPacketQueue()
 		conn.packetQueues[packet.orderChannel] = queue
 	}
-	if !queue.put(packet.orderIndex, packet.frame()) {
+
+	isReliable := packetReliable(packet.reliability)
+	var ok bool
+	if isReliable {
+		ok = queue.put(packet.orderIndex, packet.frame())
+	} else {
+		// Unreliable ordered/sequenced: track gap timeout to prevent indefinite
+		// head-of-line blocking. Matches netty-raknet FrameOrderIn gap timeout.
+		ok = queue.putUnreliable(packet.orderIndex, packet.frame())
+		if !ok {
+			return nil
+		}
+		// Gate: use 2x RTT as gap timeout (one retransmission cycle).
+		rtt := time.Duration(conn.rtt.Load())
+		gapTimeout := maxDuration(rtt*2, 100*time.Millisecond)
+		if queue.gapSince() > gapTimeout && queue.WindowSize() > 0 {
+			if gapFrames := queue.flushGap(); len(gapFrames) > 0 {
+				for _, frame := range gapFrames {
+					if err := conn.handleFrame(frame); err != nil {
+						return fmt.Errorf("error handling flushed gap frame: %v", err)
+					}
+				}
+			}
+		}
+	}
+	if !ok {
 		// An ordered packet arrived twice.
 		return nil
 	}
@@ -780,8 +854,9 @@ func (conn *Conn) handleConnectedPong(b *bytes.Buffer) error {
 	if packet.ClientTimestamp > timestamp() {
 		return fmt.Errorf("error measuring rtt: ping timestamp is in the future")
 	}
-	// We don't actually use the ConnectedPong to measure rtt. It is too
-	// unreliable and doesn't give a good idea of the connection quality.
+	t := time.Now()
+	conn.lastPongAt.Store(&t)
+	conn.hasPong.Store(true)
 	return nil
 }
 
@@ -820,7 +895,17 @@ func (conn *Conn) handleConnectionRequestAccepted(b *bytes.Buffer) error {
 // packet of its sequence, it will continue handling the full packet as it
 // otherwise would. An error is returned if the packet was not valid.
 func (conn *Conn) receiveSplitPacket(p *packet) error {
-	const maxSplitCount = 256
+	// Validate split parameters to prevent overflow/malformed DoS.
+	// Matches netty-raknet FrameJoiner.decode validation.
+	if p.splitCount <= 0 || p.splitCount > maxFragmentComponents {
+		return fmt.Errorf("invalid split count %v (max %v)", p.splitCount, maxFragmentComponents)
+	}
+	if p.splitIndex < 0 || p.splitIndex >= p.splitCount {
+		return fmt.Errorf("split index %v out of range [0, %v)", p.splitIndex, p.splitCount)
+	}
+	if uint64(p.splitCount)*uint64(maxMTUSize) > maxPendingFragmentBytes {
+		return fmt.Errorf("fragmented frame total size exceeds maximum")
+	}
 
 	// All split state (splits, splitTimes, splitReliabilities, pendingFragmentBytes)
 	// is protected by conn.mu. cleanupExpiredFragments runs on the ticker goroutine
@@ -834,12 +919,18 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 		}
 	}()
 
-	if (p.splitCount > maxSplitCount || len(conn.splits) > maxSplitCount) && conn.limits {
-		return fmt.Errorf("split count %v (%v active) exceeds the maximum %v", p.splitCount, len(conn.splits), maxSplitCount)
+	// Enforce pending builder count limit.
+	if conn.limits && len(conn.splits) >= maxPendingBuilders {
+		return fmt.Errorf("pending fragment builders exceeded: %d >= %d", len(conn.splits), maxPendingBuilders)
 	}
+
 	m, ok := conn.splits[p.splitID]
 	if !ok {
-		m = make([][]byte, p.splitCount)
+		capped := p.splitCount
+		if capped > maxFragmentComponents {
+			capped = maxFragmentComponents
+		}
+		m = make([][]byte, capped)
 		conn.splits[p.splitID] = m
 		conn.splitTimes[p.splitID] = time.Now()
 		conn.splitReliabilities[p.splitID] = p.reliability
@@ -857,6 +948,10 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	}
 	m[p.splitIndex] = p.content
 	conn.pendingFragmentBytes += len(p.content)
+
+	// Refresh the creation time on each fragment arrival.
+	// Matches netty-raknet FrameJoiner Builder.add behavior.
+	conn.splitTimes[p.splitID] = time.Now()
 
 	size := 0
 	for _, fragment := range m {
@@ -883,10 +978,11 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 
 // cleanupExpiredFragments removes incomplete fragments that have exceeded their
 // timeout. Reliable fragments use reliableFragmentTimeout; unreliable fragments
-// use fragmentTimeout.
+// use fragmentTimeout. On reliable fragment timeout, the connection is closed
+// to avoid permanent data loss (fragments already ACKed won't be retransmitted).
 func (conn *Conn) cleanupExpiredFragments() {
 	conn.mu.Lock()
-	defer conn.mu.Unlock()
+	var doClose bool
 	now := time.Now()
 	for splitID, t := range conn.splitTimes {
 		reliability, tracked := conn.splitReliabilities[splitID]
@@ -895,8 +991,17 @@ func (conn *Conn) cleanupExpiredFragments() {
 			timeout = reliableFragmentTimeout
 		}
 		if now.Sub(t) > timeout {
+			if tracked && packetReliable(reliability) {
+				conn.releaseSplitLocked(splitID)
+				doClose = true
+				break
+			}
 			conn.releaseSplitLocked(splitID)
 		}
+	}
+	conn.mu.Unlock()
+	if doClose {
+		_ = conn.Close()
 	}
 }
 

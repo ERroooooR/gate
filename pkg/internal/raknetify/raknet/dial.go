@@ -319,39 +319,73 @@ type connState struct {
 	// mtuSize is the final MTU size found by sending an open connection request
 	// 1 packet. It is the MTU size sent by the server.
 	mtuSize uint32
+
+	// retryCount tracks the number of retries in the current connection phase.
+	// Used for burst scheduling and MTU reduction.
+	retryCount int
+}
+
+const (
+	// burstCount is the number of fast burst retries during connection setup.
+	burstCount = 2
+	// burstDelay is the delay between burst retries.
+	burstDelay = 10 * time.Millisecond
+	// normalRetryDelay is the normal retry interval after burst phase.
+	normalRetryDelay = 50 * time.Millisecond
+)
+
+// scheduleRetry schedules the next retry callback. During the burst phase
+// (first burstCount retries), sends are spaced 10ms apart. After that,
+// returns to the normal 50ms interval.
+func (state *connState) scheduleBurstRetry(fn func(), stop <-chan struct{}, ticker *time.Ticker) {
+	retry := state.retryCount
+	state.retryCount++
+
+	delay := normalRetryDelay
+	if retry < burstCount {
+		delay = burstDelay
+	}
+	time.AfterFunc(delay, func() {
+		select {
+		case <-stop:
+			return
+		default:
+			fn()
+		}
+	})
 }
 
 // openConnectionRequest sends open connection request 2 packets continuously
 // until it receives an open connection reply 2 packet from the server.
+// Uses burst retry: first 2 sends at 10ms apart, then 50ms interval.
 func (state *connState) openConnectionRequest(ctx context.Context) (e error) {
-	ticker := time.NewTicker(time.Second / 2)
+	ticker := time.NewTicker(normalRetryDelay)
 	defer ticker.Stop()
 
-	stop := make(chan bool)
+	stop := make(chan struct{})
 	defer func() {
 		close(stop)
 	}()
-	// Use an intermediate channel to start the ticker immediately.
-	c := make(chan struct{}, 1)
-	c <- struct{}{}
-	go func() {
-		for {
+
+	var send func()
+	send = func() {
+		if err := state.sendOpenConnectionRequest2(uint16(atomic.LoadUint32(&state.mtuSize))); err != nil {
+			e = err
+			return
+		}
+		state.scheduleBurstRetry(func() {
 			select {
-			case <-c:
-				if err := state.sendOpenConnectionRequest2(uint16(atomic.LoadUint32(&state.mtuSize))); err != nil {
-					e = err
-					return
-				}
-			case <-ticker.C:
-				c <- struct{}{}
-			case <-stop:
-				return
 			case <-ctx.Done():
 				_ = state.conn.Close()
 				return
+			default:
 			}
-		}
-	}()
+			send()
+		}, stop, ticker)
+	}
+
+	// Initial send and schedule burst chain.
+	send()
 
 	b := make([]byte, 1492)
 	for {
@@ -382,34 +416,46 @@ func (state *connState) openConnectionRequest(ctx context.Context) (e error) {
 
 // discoverMTUSize starts discovering an MTU size, the maximum packet size we
 // can send, by sending multiple open connection request 1 packets to the
-// server with a decreasing MTU size padding.
+// server with a decreasing MTU size padding. Uses burst retry: first 2 sends
+// at 10ms apart, then 50ms interval. MTU is reduced only after the burst phase
+// (every 3rd retry after burst, by 32 bytes, min 512).
 func (state *connState) discoverMTUSize(ctx context.Context) (e error) {
-	ticker := time.NewTicker(time.Second / 2)
+	ticker := time.NewTicker(normalRetryDelay)
 	defer ticker.Stop()
 
 	stop := make(chan struct{})
 	defer func() {
 		close(stop)
 	}()
+
+	// Send initial request immediately, then schedule via burst.
 	go func() {
-		sizes := []uint16{1492, 1200, 576}
-		for _, size := range sizes {
-			for attempt := 0; attempt < 3; attempt++ {
-				if err := state.sendOpenConnectionRequest1(size); err != nil {
+		initialMTU := uint16(1492)
+		if err := state.sendOpenConnectionRequest1(initialMTU); err != nil {
+			e = err
+			return
+		}
+		state.scheduleBurstRetry(func() {
+			// After burst phase, reduce MTU every 3 retries.
+			adjustedMTU := initialMTU
+			if state.retryCount >= burstCount+3 && (state.retryCount-burstCount)%3 == 0 {
+				adjustedMTU = uint16(max(int(atomic.LoadUint32(&state.mtuSize))-32, 512))
+				atomic.StoreUint32(&state.mtuSize, uint32(adjustedMTU))
+			}
+			if adjustedMTU < 130 {
+				adjustedMTU = 130
+			}
+			if err := state.sendOpenConnectionRequest1(adjustedMTU); err != nil {
+				e = err
+				return
+			}
+			state.scheduleBurstRetry(func() {
+				if err := state.sendOpenConnectionRequest1(adjustedMTU); err != nil {
 					e = err
 					return
 				}
-				select {
-				case <-ticker.C:
-					continue
-				case <-stop:
-					return
-				case <-ctx.Done():
-					_ = state.conn.Close()
-					return
-				}
-			}
-		}
+			}, stop, ticker)
+		}, stop, ticker)
 	}()
 
 	b := make([]byte, 1492)
