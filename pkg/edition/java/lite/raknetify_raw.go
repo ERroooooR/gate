@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -30,55 +29,23 @@ const (
 	rawRaknetifySweepInterval     = 15 * time.Second
 	rawRaknetifyMaxSessions       = 4096
 	rawRaknetifySocketBufferSize  = 4 * 1024 * 1024
-	rawRaknetifyDefaultIPTOS      = 0xA0 // DSCP CS5, matching raknetify DEFAULT_IP_TOS
-	rawRaknetifyWriteTimeout      = 10 * time.Millisecond
-	rawRaknetifyPacingInterval    = 0
-	rawRaknetifyMaxPacingInterval = 100 * time.Millisecond
-	rawRaknetifyBackendQueueSize  = 16
+	rawRaknetifyDefaultIPTOS      = 0xA0
 )
 
 var rawRaknetifyRouteHintMagic = []byte("GATE_RAKNET_ROUTE")
-
-// rawRaknetifyPacketPool reuses packet byte slices to reduce GC pressure
-// from per-packet copies in enqueueToBackend.
-var rawRaknetifyPacketPool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, 0, 1500)
-		return &b
-	},
-}
 
 type rawRaknetifySession struct {
 	host        string
 	routeToken  string
 	hasToken    bool
 	tokenKey    string
-	backendAddr *net.UDPAddr
 	backendConn *net.UDPConn
-	options     rawRaknetifyRouteOptions
-	toBackend   chan *[]byte
 	decrement   func()
 	lastSeen    atomic.Int64
 	closeOnce   sync.Once
-	mu          sync.RWMutex
+	mu          sync.Mutex
 	clientAddr  net.Addr
 	clientKey   string
-	queueMu     sync.RWMutex
-	closed      bool
-}
-
-type rawRaknetifyRouteHint struct {
-	host     string
-	token    string
-	hasToken bool
-}
-
-type rawRaknetifyRouteOptions struct {
-	qosTOS         int
-	idleTimeout    time.Duration
-	writeTimeout   time.Duration
-	pacingInterval time.Duration
-	queueSize      int
 }
 
 func (s *rawRaknetifySession) touch(now time.Time) {
@@ -89,12 +56,6 @@ func (s *rawRaknetifySession) close() bool {
 	closed := false
 	s.closeOnce.Do(func() {
 		closed = true
-		s.queueMu.Lock()
-		s.closed = true
-		if s.toBackend != nil {
-			close(s.toBackend)
-		}
-		s.queueMu.Unlock()
 		_ = s.backendConn.Close()
 		if s.decrement != nil {
 			s.decrement()
@@ -117,52 +78,23 @@ func (s *rawRaknetifySession) setClientAddr(clientAddr net.Addr) (oldKey, newKey
 }
 
 func (s *rawRaknetifySession) currentClientAddr() net.Addr {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.clientAddr
 }
 
 func (s *rawRaknetifySession) currentClientKey() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.clientKey
 }
 
-func (s *rawRaknetifySession) enqueueToBackend(packet []byte) bool {
-	// Fast-path: check closed and approximate capacity before allocating.
-	s.queueMu.RLock()
-	if s.closed || len(s.toBackend) >= cap(s.toBackend) {
-		s.queueMu.RUnlock()
-		return false
-	}
-	s.queueMu.RUnlock()
-
-	bp := rawRaknetifyPacketPool.Get().(*[]byte)
-	b := *bp
-	if cap(b) < len(packet) {
-		b = make([]byte, len(packet))
-		*bp = b
-	} else {
-		b = b[:len(packet)]
-	}
-	copy(b, packet)
-
-	s.queueMu.RLock()
-	defer s.queueMu.RUnlock()
-	if s.closed {
-		rawRaknetifyPacketPool.Put(bp)
-		return false
-	}
-	select {
-	case s.toBackend <- bp:
-		return true
-	default:
-		rawRaknetifyPacketPool.Put(bp)
-		return false
-	}
+type rawRaknetifyRouteHint struct {
+	host     string
+	token    string
+	hasToken bool
 }
 
-// ServeRaknetifyRaw starts a UDP route-hint based raw Raknetify passthrough listener.
 func ServeRaknetifyRaw(ctx context.Context, opts RaknetifyOptions) error {
 	if opts.Routes == nil {
 		return fmt.Errorf("raknetify routes provider is nil")
@@ -183,7 +115,6 @@ func ServeRaknetifyRaw(ctx context.Context, opts RaknetifyOptions) error {
 	if udpConn, ok := pc.(*net.UDPConn); ok {
 		tuneRawRaknetifyUDPConn(log, "listener", udpConn, rawRaknetifyDefaultIPTOS)
 	}
-	_ = pc.SetWriteDeadline(time.Time{})
 
 	srv := &rawRaknetifyServer{
 		conn:            pc,
@@ -207,14 +138,12 @@ type rawRaknetifyServer struct {
 	routes          func() []config.Route
 	strategyManager *StrategyManager
 	log             logr.Logger
-	sessions        sync.Map // map[clientAddr string]*rawRaknetifySession
-	tokenSessions   sync.Map // map[host+token string]*rawRaknetifySession
+	sessions        sync.Map
+	tokenSessions   sync.Map
 	sessionCount    atomic.Int64
 	tosMu           sync.Mutex
 	clientTOS       int
-	// migrationMu serializes session close and client address migration to prevent
-	// a race where closeSession sees a partially-updated clientKey during migration.
-	migrationMu sync.Mutex
+	migrationMu     sync.Mutex
 }
 
 func (s *rawRaknetifyServer) serve(ctx context.Context) error {
@@ -228,6 +157,7 @@ func (s *rawRaknetifyServer) serve(ctx context.Context) error {
 			return err
 		}
 		packet := buf[:n]
+
 		if hint, ok, err := decodeRawRaknetifyRouteHint(packet); ok {
 			if err != nil {
 				rawRaknetifyMetrics.recordDroppedPacket("client_to_backend", "invalid_route_hint")
@@ -249,9 +179,11 @@ func (s *rawRaknetifyServer) serve(ctx context.Context) error {
 			continue
 		}
 		session.touch(time.Now())
-		if !session.enqueueToBackend(packet) {
-			rawRaknetifyMetrics.recordDroppedPacket("client_to_backend", "backend_queue_full")
-			s.log.V(1).Info("dropping raw raknetify packet because backend queue is full", "clientAddr", clientAddr, "backendAddr", session.backendAddr)
+
+		if _, err := session.backendConn.Write(packet); err != nil {
+			rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "write_error")
+			s.log.V(1).Info("raw raknetify backend write failed, closing session", "clientAddr", clientAddr, "backendAddr", session.backendConn.RemoteAddr(), "error", err)
+			s.closeSession(session, "backend_write_error")
 		}
 	}
 }
@@ -273,14 +205,14 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 	tokenKey := rawRaknetifyTokenKey(hint)
 	if tokenKey != "" {
 		if value, ok := s.tokenSessions.Load(tokenKey); ok {
-			if existing, ok := value.(*rawRaknetifySession); ok && existing.sameRouteHint(hint) {
+			if existing, ok := value.(*rawRaknetifySession); ok && strings.EqualFold(existing.host, hint.host) {
 				if current, ok := s.loadSession(clientAddr); ok && current != existing {
 					rawRaknetifyMetrics.recordSessionEvent("replaced", "migration_conflict")
 					s.closeSession(current, "migration_conflict")
 				}
 				if oldKey, newKey, migrated := s.migrateSessionClient(existing, clientAddr); migrated {
 					rawRaknetifyMetrics.recordSessionEvent("migrated", "")
-					s.log.Info("migrated raw raknetify session", "oldClientAddr", oldKey, "clientAddr", newKey, "backendAddr", existing.backendAddr)
+					s.log.Info("migrated raw raknetify session", "oldClientAddr", oldKey, "clientAddr", newKey, "backendAddr", existing.backendConn.RemoteAddr())
 				}
 				existing.touch(time.Now())
 				return existing, nil
@@ -288,9 +220,12 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 		}
 	}
 	if existing, ok := s.loadSession(clientAddr); ok {
-		if existing.sameRouteHint(hint) {
-			existing.touch(time.Now())
-			return existing, nil
+		if strings.EqualFold(existing.host, hint.host) {
+			if existing.hasToken && hint.hasToken && existing.routeToken != hint.token {
+			} else {
+				existing.touch(time.Now())
+				return existing, nil
+			}
 		}
 		rawRaknetifyMetrics.recordSessionEvent("replaced", "")
 		s.closeSession(existing, "replaced")
@@ -308,19 +243,14 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial raw raknetify backend %s: %w", backendAddr, err)
 	}
-	options := rawRaknetifyOptionsForRoute(route)
-	tuneRawRaknetifyUDPConn(log, "backend", backendConn, options.qosTOS)
-	_ = backendConn.SetWriteDeadline(time.Time{})
+	tuneRawRaknetifyUDPConn(log, "backend", backendConn, rawRaknetifyQOSTOSForRoute(route))
 
 	session := &rawRaknetifySession{
 		host:        hint.host,
 		routeToken:  hint.token,
 		hasToken:    hint.hasToken,
 		tokenKey:    tokenKey,
-		backendAddr: backendAddr,
 		backendConn: backendConn,
-		options:     options,
-		toBackend:   make(chan *[]byte, options.queueSize),
 		clientAddr:  clientAddr,
 		clientKey:   key,
 	}
@@ -337,21 +267,8 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 	rawRaknetifyMetrics.recordSessionEvent("created", "")
 
 	log.Info("created raw raknetify session", "clientAddr", clientAddr, "backendAddr", backendAddr)
-	go s.copyClientToBackend(session)
 	go s.copyBackendToClient(session)
 	return session, nil
-}
-
-func (s *rawRaknetifySession) sameRouteHint(hint rawRaknetifyRouteHint) bool {
-	if !strings.EqualFold(s.host, hint.host) {
-		return false
-	}
-	if s.hasToken && hint.hasToken {
-		return s.routeToken == hint.token
-	}
-	// v1 hints: neither side has a token, match by host only.
-	// If one has a token and the other doesn't, it's a mismatch.
-	return !s.hasToken && !hint.hasToken
 }
 
 func (s *rawRaknetifyServer) migrateSessionClient(session *rawRaknetifySession, clientAddr net.Addr) (oldKey, newKey string, migrated bool) {
@@ -364,8 +281,6 @@ func (s *rawRaknetifyServer) migrateSessionClient(session *rawRaknetifySession, 
 	}
 	if value, ok := s.sessions.Load(newKey); ok {
 		if existing, ok := value.(*rawRaknetifySession); ok && existing != session {
-			// Remove conflicting session from the map under our lock,
-			// then finalize close without re-acquiring migrationMu (no deadlock).
 			s.sessions.CompareAndDelete(newKey, existing)
 			s.finalizeSessionClose(existing, "migration_conflict")
 		}
@@ -377,42 +292,35 @@ func (s *rawRaknetifyServer) migrateSessionClient(session *rawRaknetifySession, 
 	return oldKey, newKey, true
 }
 
-func tuneRawRaknetifyUDPConn(log logr.Logger, name string, conn *net.UDPConn, tos int) {
-	setRawRaknetifyUDPQoS(log, name, conn, tos)
-	if err := conn.SetReadBuffer(rawRaknetifySocketBufferSize); err != nil {
-		log.V(1).Info("failed to set raw raknetify UDP read buffer", "socket", name, "bytes", rawRaknetifySocketBufferSize, "error", err)
-	}
-	if err := conn.SetWriteBuffer(rawRaknetifySocketBufferSize); err != nil {
-		log.V(1).Info("failed to set raw raknetify UDP write buffer", "socket", name, "bytes", rawRaknetifySocketBufferSize, "error", err)
+func (s *rawRaknetifyServer) copyBackendToClient(session *rawRaknetifySession) {
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := session.backendConn.Read(buf)
+		if err != nil {
+			clientAddr := session.currentClientAddr()
+			s.log.V(1).Info("closing raw raknetify session after backend read failed", "clientAddr", clientAddr, "backendAddr", session.backendConn.RemoteAddr(), "error", err)
+			s.closeSession(session, "backend_read_error")
+			return
+		}
+		session.touch(time.Now())
+
+		clientAddr := session.currentClientAddr()
+		if clientAddr == nil {
+			s.closeSession(session, "no_client_addr")
+			return
+		}
+		if _, err = s.writeToClient(clientAddr, buf[:n]); err != nil {
+			rawRaknetifyMetrics.recordWriteFailure("backend_to_client", "write_error")
+			s.log.V(1).Info("closing raw raknetify session after client write failed", "clientAddr", clientAddr, "backendAddr", session.backendConn.RemoteAddr(), "error", err)
+			s.closeSession(session, "client_write_error")
+			return
+		}
 	}
 }
 
-func setRawRaknetifyUDPQoS(log logr.Logger, name string, conn *net.UDPConn, tos int) {
-	if err := ipv4.NewPacketConn(conn).SetTOS(tos); err != nil {
-		log.V(1).Info("failed to set raw raknetify IPv4 TOS", "socket", name, "tos", tos, "error", err)
-	}
-	if err := ipv6.NewPacketConn(conn).SetTrafficClass(tos); err != nil {
-		log.V(1).Info("failed to set raw raknetify IPv6 traffic class", "socket", name, "trafficClass", tos, "error", err)
-	}
-}
-
-func (s *rawRaknetifyServer) writeToBackend(session *rawRaknetifySession, packet []byte) error {
-	clientAddr := session.currentClientAddr()
-	if err := session.backendConn.SetWriteDeadline(time.Now().Add(session.options.writeTimeout)); err != nil {
-		rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "deadline_error")
-		s.log.V(1).Info("failed to set raw raknetify backend write deadline", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "timeout", session.options.writeTimeout, "error", err)
-	}
-	_, err := session.backendConn.Write(packet)
-	return err
-}
-
-func (s *rawRaknetifyServer) writeToClient(session *rawRaknetifySession, packet []byte) error {
-	clientAddr := session.currentClientAddr()
-	if clientAddr == nil {
-		return net.ErrClosed
-	}
+func (s *rawRaknetifyServer) writeToClient(clientAddr net.Addr, packet []byte) (int, error) {
 	if udpConn, ok := s.conn.(*net.UDPConn); ok {
-		tos := session.options.qosTOS
+		tos := rawRaknetifyDefaultIPTOS
 		s.tosMu.Lock()
 		if s.clientTOS != tos {
 			setRawRaknetifyUDPQoS(s.log, "listener", udpConn, tos)
@@ -420,13 +328,74 @@ func (s *rawRaknetifyServer) writeToClient(session *rawRaknetifySession, packet 
 		}
 		s.tosMu.Unlock()
 	}
-	_, err := s.conn.WriteTo(packet, clientAddr)
-	return err
+	return s.conn.WriteTo(packet, clientAddr)
 }
 
-func isRawRaknetifyWriteTimeout(err error) bool {
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
+func (s *rawRaknetifyServer) closeSession(session *rawRaknetifySession, reason string) {
+	if session == nil {
+		return
+	}
+	s.migrationMu.Lock()
+	key := session.currentClientKey()
+	if key != "" {
+		s.sessions.CompareAndDelete(key, session)
+	}
+	if session.tokenKey != "" {
+		s.tokenSessions.CompareAndDelete(session.tokenKey, session)
+	}
+	s.migrationMu.Unlock()
+
+	s.finalizeSessionClose(session, reason)
+}
+
+func (s *rawRaknetifyServer) finalizeSessionClose(session *rawRaknetifySession, reason string) {
+	if session == nil {
+		return
+	}
+	if session.tokenKey != "" {
+		s.tokenSessions.CompareAndDelete(session.tokenKey, session)
+	}
+	if session.close() {
+		s.sessionCount.Add(-1)
+		rawRaknetifyMetrics.addActiveSessions(-1)
+		rawRaknetifyMetrics.recordSessionEvent("closed", reason)
+	}
+}
+
+func (s *rawRaknetifyServer) closeAllSessions() {
+	s.sessions.Range(func(key, value any) bool {
+		_, keyOK := key.(string)
+		session, sessionOK := value.(*rawRaknetifySession)
+		if keyOK && sessionOK {
+			s.closeSession(session, "shutdown")
+		}
+		return true
+	})
+}
+
+func (s *rawRaknetifyServer) closeIdleSessions(now time.Time) {
+	s.sessions.Range(func(key, value any) bool {
+		session, sessionOK := value.(*rawRaknetifySession)
+		_, keyOK := key.(string)
+		if sessionOK && keyOK && session.lastSeen.Load() < now.Add(-rawRaknetifyIdleTimeout).UnixNano() {
+			s.closeSession(session, "idle_timeout")
+		}
+		return true
+	})
+}
+
+func (s *rawRaknetifyServer) sweep(ctx context.Context) {
+	ticker := time.NewTicker(rawRaknetifySweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			s.closeAllSessions()
+			return
+		case now := <-ticker.C:
+			s.closeIdleSessions(now)
+		}
+	}
 }
 
 func (s *rawRaknetifyServer) resolveBackend(host string, clientAddr net.Addr) (*net.UDPAddr, string, *config.Route, logr.Logger, error) {
@@ -478,150 +447,22 @@ func (s *rawRaknetifyServer) resolveBackend(host string, clientAddr net.Addr) (*
 	return backendAddr, backendKey, route, log, nil
 }
 
-func (s *rawRaknetifyServer) copyClientToBackend(session *rawRaknetifySession) {
-	var nextWrite time.Time
-	for bp := range session.toBackend {
-		packet := *bp
-		nextWrite = paceRawRaknetifyWrite(nextWrite, session.options.pacingInterval)
-		session.touch(time.Now())
-		if err := s.writeToBackend(session, packet); err != nil {
-			clientAddr := session.currentClientAddr()
-			if isRawRaknetifyWriteTimeout(err) {
-				rawRaknetifyMetrics.recordDroppedPacket("client_to_backend", "write_timeout")
-				rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "timeout")
-				s.log.V(1).Info("dropping raw raknetify packet after backend write timed out", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
-				rawRaknetifyPacketPool.Put(bp)
-				continue
-			}
-			rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "error")
-			s.log.V(1).Info("closing raw raknetify session after backend write failed", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
-			s.closeSession(session, "backend_write_error")
-			return
-		}
-		rawRaknetifyPacketPool.Put(bp)
+func tuneRawRaknetifyUDPConn(log logr.Logger, name string, conn *net.UDPConn, tos int) {
+	setRawRaknetifyUDPQoS(log, name, conn, tos)
+	if err := conn.SetReadBuffer(rawRaknetifySocketBufferSize); err != nil {
+		log.V(1).Info("failed to set raw raknetify UDP read buffer", "socket", name, "bytes", rawRaknetifySocketBufferSize, "error", err)
+	}
+	if err := conn.SetWriteBuffer(rawRaknetifySocketBufferSize); err != nil {
+		log.V(1).Info("failed to set raw raknetify UDP write buffer", "socket", name, "bytes", rawRaknetifySocketBufferSize, "error", err)
 	}
 }
 
-func (s *rawRaknetifyServer) copyBackendToClient(session *rawRaknetifySession) {
-	buf := make([]byte, 64*1024)
-	var nextWrite time.Time
-	for {
-		n, err := session.backendConn.Read(buf)
-		if err != nil {
-			clientAddr := session.currentClientAddr()
-			s.log.V(1).Info("closing raw raknetify session after backend read failed", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
-			s.closeSession(session, "backend_read_error")
-			return
-		}
-		nextWrite = paceRawRaknetifyWrite(nextWrite, session.options.pacingInterval)
-		session.touch(time.Now())
-		if err = s.writeToClient(session, buf[:n]); err != nil {
-			clientAddr := session.currentClientAddr()
-			if isRawRaknetifyWriteTimeout(err) {
-				rawRaknetifyMetrics.recordDroppedPacket("backend_to_client", "write_timeout")
-				rawRaknetifyMetrics.recordWriteFailure("backend_to_client", "timeout")
-				s.log.V(1).Info("dropping raw raknetify packet after client write timed out", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
-				continue
-			}
-			rawRaknetifyMetrics.recordWriteFailure("backend_to_client", "error")
-			s.log.V(1).Info("closing raw raknetify session after client write failed", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "error", err)
-			s.closeSession(session, "client_write_error")
-			return
-		}
+func setRawRaknetifyUDPQoS(log logr.Logger, name string, conn *net.UDPConn, tos int) {
+	if err := ipv4.NewPacketConn(conn).SetTOS(tos); err != nil {
+		log.V(1).Info("failed to set raw raknetify IPv4 TOS", "socket", name, "tos", tos, "error", err)
 	}
-}
-
-func paceRawRaknetifyWrite(nextWrite time.Time, interval time.Duration) time.Time {
-	if interval <= 0 {
-		return time.Time{}
-	}
-	// Clamp to a reasonable maximum so shutdown does not hang on long sleeps.
-	if interval > rawRaknetifyMaxPacingInterval {
-		interval = rawRaknetifyMaxPacingInterval
-	}
-	now := time.Now()
-	if now.Before(nextWrite) {
-		sleepDuration := nextWrite.Sub(now)
-		if sleepDuration > rawRaknetifyMaxPacingInterval {
-			sleepDuration = rawRaknetifyMaxPacingInterval
-		}
-		time.Sleep(sleepDuration)
-		now = time.Now()
-	}
-	return now.Add(interval)
-}
-
-func (s *rawRaknetifyServer) closeSession(session *rawRaknetifySession, reason string) {
-	if session == nil {
-		return
-	}
-	// Atomically remove from both maps under migrationMu to prevent a race
-	// where ensureSession finds the session via tokenSessions after sessions
-	// is cleaned but before the session is actually closed.
-	s.migrationMu.Lock()
-	key := session.currentClientKey()
-	if key != "" {
-		s.sessions.CompareAndDelete(key, session)
-	}
-	if session.tokenKey != "" {
-		s.tokenSessions.CompareAndDelete(session.tokenKey, session)
-	}
-	s.migrationMu.Unlock()
-
-	s.finalizeSessionClose(session, reason)
-}
-
-// finalizeSessionClose completes the non-map parts of session cleanup.
-// tokenSessions is cleaned up by closeSession under migrationMu before
-// calling this; the CompareAndDelete here is kept for the migrateSessionClient
-// conflict path where migrationMu is already held by the caller.
-func (s *rawRaknetifyServer) finalizeSessionClose(session *rawRaknetifySession, reason string) {
-	if session == nil {
-		return
-	}
-	if session.tokenKey != "" {
-		s.tokenSessions.CompareAndDelete(session.tokenKey, session)
-	}
-	if session.close() {
-		s.sessionCount.Add(-1)
-		rawRaknetifyMetrics.addActiveSessions(-1)
-		rawRaknetifyMetrics.recordSessionEvent("closed", reason)
-	}
-}
-
-func (s *rawRaknetifyServer) closeAllSessions() {
-	s.sessions.Range(func(key, value any) bool {
-		_, keyOK := key.(string)
-		session, sessionOK := value.(*rawRaknetifySession)
-		if keyOK && sessionOK {
-			s.closeSession(session, "shutdown")
-		}
-		return true
-	})
-}
-
-func (s *rawRaknetifyServer) closeIdleSessions(now time.Time) {
-	s.sessions.Range(func(key, value any) bool {
-		session, sessionOK := value.(*rawRaknetifySession)
-		_, keyOK := key.(string)
-		if sessionOK && keyOK && session.lastSeen.Load() < now.Add(-session.options.idleTimeout).UnixNano() {
-			s.closeSession(session, "idle_timeout")
-		}
-		return true
-	})
-}
-
-func (s *rawRaknetifyServer) sweep(ctx context.Context) {
-	ticker := time.NewTicker(rawRaknetifySweepInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			s.closeAllSessions()
-			return
-		case now := <-ticker.C:
-			s.closeIdleSessions(now)
-		}
+	if err := ipv6.NewPacketConn(conn).SetTrafficClass(tos); err != nil {
+		log.V(1).Info("failed to set raw raknetify IPv6 traffic class", "socket", name, "trafficClass", tos, "error", err)
 	}
 }
 
@@ -685,36 +526,17 @@ func rawRaknetifyTokenKey(hint rawRaknetifyRouteHint) string {
 	return strings.ToLower(hint.host) + "\x00" + hint.token
 }
 
-func rawRaknetifyOptionsForRoute(route *config.Route) rawRaknetifyRouteOptions {
+func rawRaknetifyQOSTOSForRoute(route *config.Route) int {
 	raw := route.Raknetify.RawPassthrough
-	options := rawRaknetifyRouteOptions{
-		qosTOS:         rawRaknetifyDefaultIPTOS,
-		idleTimeout:    rawRaknetifyIdleTimeout,
-		writeTimeout:   rawRaknetifyWriteTimeout,
-		pacingInterval: rawRaknetifyPacingInterval,
-		queueSize:      rawRaknetifyBackendQueueSize,
-	}
 	switch raw.QOS.Mode {
 	case config.RaknetifyQOSModeClear:
-		options.qosTOS = 0
+		return 0
 	case config.RaknetifyQOSModeCustom:
 		if raw.QOS.TOS != nil {
-			options.qosTOS = *raw.QOS.TOS
+			return *raw.QOS.TOS
 		}
 	}
-	if raw.IdleTimeout > 0 {
-		options.idleTimeout = time.Duration(raw.IdleTimeout)
-	}
-	if raw.WriteTimeout > 0 {
-		options.writeTimeout = time.Duration(raw.WriteTimeout)
-	}
-	if raw.PacingInterval > 0 {
-		options.pacingInterval = time.Duration(raw.PacingInterval)
-	}
-	if raw.QueueSize > 0 {
-		options.queueSize = raw.QueueSize
-	}
-	return options
+	return rawRaknetifyDefaultIPTOS
 }
 
 func resolveRawRaknetifyBackend(backendAddr string) (*net.UDPAddr, error) {
