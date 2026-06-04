@@ -32,7 +32,7 @@ const (
 	rawRaknetifySocketBufferSize  = 4 * 1024 * 1024
 	rawRaknetifyDefaultIPTOS      = 0xA0 // DSCP CS5, matching raknetify DEFAULT_IP_TOS
 	rawRaknetifyWriteTimeout      = 10 * time.Millisecond
-	rawRaknetifyPacingInterval    = 100 * time.Microsecond
+	rawRaknetifyPacingInterval    = 0
 	rawRaknetifyMaxPacingInterval = 100 * time.Millisecond
 	rawRaknetifyBackendQueueSize  = 256
 )
@@ -165,6 +165,7 @@ func ServeRaknetifyRaw(ctx context.Context, opts RaknetifyOptions) error {
 	if udpConn, ok := pc.(*net.UDPConn); ok {
 		tuneRawRaknetifyUDPConn(log, "listener", udpConn, rawRaknetifyDefaultIPTOS)
 	}
+	_ = pc.SetWriteDeadline(time.Time{})
 
 	srv := &rawRaknetifyServer{
 		conn:            pc,
@@ -191,7 +192,7 @@ type rawRaknetifyServer struct {
 	sessions        sync.Map // map[clientAddr string]*rawRaknetifySession
 	tokenSessions   sync.Map // map[host+token string]*rawRaknetifySession
 	sessionCount    atomic.Int64
-	clientWriteMu   sync.Mutex
+	tosMu           sync.Mutex
 	clientTOS       int
 	// migrationMu serializes session close and client address migration to prevent
 	// a race where closeSession sees a partially-updated clientKey during migration.
@@ -291,6 +292,7 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 	}
 	options := rawRaknetifyOptionsForRoute(route)
 	tuneRawRaknetifyUDPConn(log, "backend", backendConn, options.qosTOS)
+	_ = backendConn.SetWriteDeadline(time.Time{})
 
 	session := &rawRaknetifySession{
 		host:        hint.host,
@@ -377,11 +379,6 @@ func setRawRaknetifyUDPQoS(log logr.Logger, name string, conn *net.UDPConn, tos 
 }
 
 func (s *rawRaknetifyServer) writeToBackend(session *rawRaknetifySession, packet []byte) error {
-	clientAddr := session.currentClientAddr()
-	if err := session.backendConn.SetWriteDeadline(time.Now().Add(session.options.writeTimeout)); err != nil {
-		rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "deadline_error")
-		s.log.V(1).Info("failed to set raw raknetify backend write deadline", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "timeout", session.options.writeTimeout, "error", err)
-	}
 	_, err := session.backendConn.Write(packet)
 	return err
 }
@@ -391,15 +388,14 @@ func (s *rawRaknetifyServer) writeToClient(session *rawRaknetifySession, packet 
 	if clientAddr == nil {
 		return net.ErrClosed
 	}
-	s.clientWriteMu.Lock()
-	defer s.clientWriteMu.Unlock()
-	if udpConn, ok := s.conn.(*net.UDPConn); ok && s.clientTOS != session.options.qosTOS {
-		setRawRaknetifyUDPQoS(s.log, "listener", udpConn, session.options.qosTOS)
-		s.clientTOS = session.options.qosTOS
-	}
-	if err := s.conn.SetWriteDeadline(time.Now().Add(session.options.writeTimeout)); err != nil {
-		rawRaknetifyMetrics.recordWriteFailure("backend_to_client", "deadline_error")
-		s.log.V(1).Info("failed to set raw raknetify client write deadline", "clientAddr", clientAddr, "backendAddr", session.backendAddr, "timeout", session.options.writeTimeout, "error", err)
+	if udpConn, ok := s.conn.(*net.UDPConn); ok {
+		tos := session.options.qosTOS
+		s.tosMu.Lock()
+		if s.clientTOS != tos {
+			setRawRaknetifyUDPQoS(s.log, "listener", udpConn, tos)
+			s.clientTOS = tos
+		}
+		s.tosMu.Unlock()
 	}
 	_, err := s.conn.WriteTo(packet, clientAddr)
 	return err
