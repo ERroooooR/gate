@@ -1,4 +1,4 @@
-﻿package lite
+package lite
 
 import (
 	"bytes"
@@ -25,21 +25,12 @@ const (
 	rawRaknetifyRouteHintVersion2 = byte(2)
 	rawRaknetifyRouteTokenLen     = 16
 	rawRaknetifyMaxHintHostLen    = 1024
-	// rawRaknetifyDefaultIdleTimeout is the default idle timeout for raw sessions
-	// when not configured in the route. It is set to 2x the server-side RakNet read
-	// timeout (15s) to give enough margin for ping/pong exchanges while cleaning up
-	// stale sessions promptly.
-	rawRaknetifyDefaultIdleTimeout = 30 * time.Second
+	rawRaknetifyDefaultIdleTimeout = time.Minute
 	rawRaknetifySweepInterval     = 15 * time.Second
 	rawRaknetifyMaxSessions       = 4096
 	rawRaknetifySocketBufferSize  = 4 * 1024 * 1024
 	rawRaknetifyDefaultIPTOS      = 0xA0
-	// rawRaknetifyDefaultReadDeadline is the maximum time to wait for a backend read.
-	// This prevents copyBackendToClient from hanging indefinitely on a dead backend.
-	// Set to sweep interval + 5s so normal pings (every 200ms) won't trigger it.
-	rawRaknetifyDefaultReadDeadline = 20 * time.Second
 )
-
 var rawRaknetifyRouteHintMagic = []byte("GATE_RAKNET_ROUTE")
 
 type rawRaknetifySession struct {
@@ -326,12 +317,6 @@ func (s *rawRaknetifyServer) migrateSessionClient(session *rawRaknetifySession, 
 func (s *rawRaknetifyServer) copyBackendToClient(session *rawRaknetifySession) {
 	buf := make([]byte, 64*1024)
 	for {
-		// Apply a read deadline to prevent hanging on a dead backend.
-		// The deadline is set to rawRaknetifyDefaultReadDeadline, which is longer than
-		// the server-side RakNet ping interval (200ms) so normal traffic won't trigger it,
-		// but short enough to detect a truly dead backend within one sweep cycle.
-		_ = session.backendConn.SetReadDeadline(time.Now().Add(rawRaknetifyDefaultReadDeadline))
-
 		n, err := session.backendConn.Read(buf)
 		if err != nil {
 			clientAddr := session.currentClientAddr()
