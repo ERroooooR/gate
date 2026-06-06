@@ -25,11 +25,19 @@ const (
 	rawRaknetifyRouteHintVersion2 = byte(2)
 	rawRaknetifyRouteTokenLen     = 16
 	rawRaknetifyMaxHintHostLen    = 1024
-	rawRaknetifyIdleTimeout       = time.Minute
+	// rawRaknetifyDefaultIdleTimeout is the default idle timeout for raw sessions
+	// when not configured in the route. It is set to 2x the server-side RakNet read
+	// timeout (15s) to give enough margin for ping/pong exchanges while cleaning up
+	// stale sessions promptly.
+	rawRaknetifyDefaultIdleTimeout = 30 * time.Second
 	rawRaknetifySweepInterval     = 15 * time.Second
 	rawRaknetifyMaxSessions       = 4096
 	rawRaknetifySocketBufferSize  = 4 * 1024 * 1024
 	rawRaknetifyDefaultIPTOS      = 0xA0
+	// rawRaknetifyDefaultReadDeadline is the maximum time to wait for a backend read.
+	// This prevents copyBackendToClient from hanging indefinitely on a dead backend.
+	// Set to sweep interval + 5s so normal pings (every 200ms) won't trigger it.
+	rawRaknetifyDefaultReadDeadline = 20 * time.Second
 )
 
 var rawRaknetifyRouteHintMagic = []byte("GATE_RAKNET_ROUTE")
@@ -46,6 +54,12 @@ type rawRaknetifySession struct {
 	mu          sync.Mutex
 	clientAddr  net.Addr
 	clientKey   string
+	// idleTimeout is the per-session idle timeout derived from the route config.
+	// If the route has no configured IdleTimeout, rawRaknetifyDefaultIdleTimeout is used.
+	idleTimeout time.Duration
+	// writeDeadline is the per-session write deadline derived from the route config.
+	// 0 means no deadline.
+	writeDeadline time.Duration
 }
 
 func (s *rawRaknetifySession) touch(now time.Time) {
@@ -121,7 +135,7 @@ func ServeRaknetifyRaw(ctx context.Context, opts RaknetifyOptions) error {
 		routes:          opts.Routes,
 		strategyManager: opts.StrategyManager,
 		log:             log,
-		clientTOS:       rawRaknetifyDefaultIPTOS,
+		clientTOS:       -1, // force TOS set on first write
 	}
 
 	go func() {
@@ -179,6 +193,10 @@ func (s *rawRaknetifyServer) serve(ctx context.Context) error {
 			continue
 		}
 		session.touch(time.Now())
+
+		if session.writeDeadline > 0 {
+			_ = session.backendConn.SetWriteDeadline(time.Now().Add(session.writeDeadline))
+		}
 
 		if _, err := session.backendConn.Write(packet); err != nil {
 			rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "write_error")
@@ -245,14 +263,27 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 	}
 	tuneRawRaknetifyUDPConn(log, "backend", backendConn, rawRaknetifyQOSTOSForRoute(route))
 
+	// Determine per-session timeouts from route config, with sensible defaults.
+	sessionIdleTimeout := rawRaknetifyDefaultIdleTimeout
+	sessionWriteDeadline := time.Duration(0) // no deadline by default
+	raw := route.Raknetify.RawPassthrough
+	if raw.IdleTimeout > 0 {
+		sessionIdleTimeout = time.Duration(raw.IdleTimeout)
+	}
+	if raw.WriteTimeout > 0 {
+		sessionWriteDeadline = time.Duration(raw.WriteTimeout)
+	}
+
 	session := &rawRaknetifySession{
-		host:        hint.host,
-		routeToken:  hint.token,
-		hasToken:    hint.hasToken,
-		tokenKey:    tokenKey,
-		backendConn: backendConn,
-		clientAddr:  clientAddr,
-		clientKey:   key,
+		host:           hint.host,
+		routeToken:     hint.token,
+		hasToken:       hint.hasToken,
+		tokenKey:       tokenKey,
+		backendConn:    backendConn,
+		clientAddr:     clientAddr,
+		clientKey:      key,
+		idleTimeout:    sessionIdleTimeout,
+		writeDeadline:  sessionWriteDeadline,
 	}
 	if route.Strategy == config.StrategyLeastConnections {
 		session.decrement = s.strategyManager.IncrementConnection(backendKey)
@@ -295,6 +326,12 @@ func (s *rawRaknetifyServer) migrateSessionClient(session *rawRaknetifySession, 
 func (s *rawRaknetifyServer) copyBackendToClient(session *rawRaknetifySession) {
 	buf := make([]byte, 64*1024)
 	for {
+		// Apply a read deadline to prevent hanging on a dead backend.
+		// The deadline is set to rawRaknetifyDefaultReadDeadline, which is longer than
+		// the server-side RakNet ping interval (200ms) so normal traffic won't trigger it,
+		// but short enough to detect a truly dead backend within one sweep cycle.
+		_ = session.backendConn.SetReadDeadline(time.Now().Add(rawRaknetifyDefaultReadDeadline))
+
 		n, err := session.backendConn.Read(buf)
 		if err != nil {
 			clientAddr := session.currentClientAddr()
@@ -320,11 +357,12 @@ func (s *rawRaknetifyServer) copyBackendToClient(session *rawRaknetifySession) {
 
 func (s *rawRaknetifyServer) writeToClient(clientAddr net.Addr, packet []byte) (int, error) {
 	if udpConn, ok := s.conn.(*net.UDPConn); ok {
-		tos := rawRaknetifyDefaultIPTOS
+		// clientTOS is initialized to -1, so the first call always sets TOS.
+		// Subsequent calls only update TOS if it has changed.
 		s.tosMu.Lock()
-		if s.clientTOS != tos {
-			setRawRaknetifyUDPQoS(s.log, "listener", udpConn, tos)
-			s.clientTOS = tos
+		if s.clientTOS != rawRaknetifyDefaultIPTOS {
+			setRawRaknetifyUDPQoS(s.log, "listener", udpConn, rawRaknetifyDefaultIPTOS)
+			s.clientTOS = rawRaknetifyDefaultIPTOS
 		}
 		s.tosMu.Unlock()
 	}
@@ -377,8 +415,20 @@ func (s *rawRaknetifyServer) closeIdleSessions(now time.Time) {
 	s.sessions.Range(func(key, value any) bool {
 		session, sessionOK := value.(*rawRaknetifySession)
 		_, keyOK := key.(string)
-		if sessionOK && keyOK && session.lastSeen.Load() < now.Add(-rawRaknetifyIdleTimeout).UnixNano() {
-			s.closeSession(session, "idle_timeout")
+		if sessionOK && keyOK {
+			// Use per-session idle timeout, falling back to the default.
+			idleTimeout := session.idleTimeout
+			if idleTimeout <= 0 {
+				idleTimeout = rawRaknetifyDefaultIdleTimeout
+			}
+			if session.lastSeen.Load() < now.Add(-idleTimeout).UnixNano() {
+				s.log.V(1).Info("closing idle raw raknetify session",
+					"clientAddr", session.currentClientAddr(),
+					"backendAddr", session.backendConn.RemoteAddr(),
+					"idleTimeout", idleTimeout,
+					"host", session.host)
+				s.closeSession(session, "idle_timeout")
+			}
 		}
 		return true
 	})
