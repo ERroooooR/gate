@@ -30,6 +30,7 @@ const (
 	rawRaknetifyMaxSessions       = 4096
 	rawRaknetifySocketBufferSize  = 4 * 1024 * 1024
 	rawRaknetifyDefaultIPTOS      = 0xA0
+	rawRaknetifyBackendQueueSize = 256
 )
 var rawRaknetifyRouteHintMagic = []byte("GATE_RAKNET_ROUTE")
 
@@ -51,6 +52,9 @@ type rawRaknetifySession struct {
 	// writeDeadline is the per-session write deadline derived from the route config.
 	// 0 means no deadline.
 	writeDeadline time.Duration
+	toBackend   chan []byte
+	queueMu     sync.Mutex
+	closed      bool
 }
 
 func (s *rawRaknetifySession) touch(now time.Time) {
@@ -61,6 +65,12 @@ func (s *rawRaknetifySession) close() bool {
 	closed := false
 	s.closeOnce.Do(func() {
 		closed = true
+		s.queueMu.Lock()
+		s.closed = true
+		if s.toBackend != nil {
+			close(s.toBackend)
+		}
+		s.queueMu.Unlock()
 		_ = s.backendConn.Close()
 		if s.decrement != nil {
 			s.decrement()
@@ -92,6 +102,22 @@ func (s *rawRaknetifySession) currentClientKey() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.clientKey
+}
+
+func (s *rawRaknetifySession) enqueueToBackend(packet []byte) bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if s.closed {
+		return false
+	}
+	copied := make([]byte, len(packet))
+	copy(copied, packet)
+	select {
+	case s.toBackend <- copied:
+		return true
+	default:
+		return false
+	}
 }
 
 type rawRaknetifyRouteHint struct {
@@ -185,14 +211,9 @@ func (s *rawRaknetifyServer) serve(ctx context.Context) error {
 		}
 		session.touch(time.Now())
 
-		if session.writeDeadline > 0 {
-			_ = session.backendConn.SetWriteDeadline(time.Now().Add(session.writeDeadline))
-		}
-
-		if _, err := session.backendConn.Write(packet); err != nil {
-			rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "write_error")
-			s.log.V(1).Info("raw raknetify backend write failed, closing session", "clientAddr", clientAddr, "backendAddr", session.backendConn.RemoteAddr(), "error", err)
-			s.closeSession(session, "backend_write_error")
+		if !session.enqueueToBackend(packet) {
+			rawRaknetifyMetrics.recordDroppedPacket("client_to_backend", "backend_queue_full")
+			s.log.V(1).Info("dropping raw raknetify packet because backend queue is full", "clientAddr", clientAddr, "backendAddr", session.backendConn.RemoteAddr())
 		}
 	}
 }
@@ -275,6 +296,7 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 		clientKey:      key,
 		idleTimeout:    sessionIdleTimeout,
 		writeDeadline:  sessionWriteDeadline,
+		toBackend:      make(chan []byte, rawRaknetifyBackendQueueSize),
 	}
 	if route.Strategy == config.StrategyLeastConnections {
 		session.decrement = s.strategyManager.IncrementConnection(backendKey)
@@ -289,6 +311,7 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 	rawRaknetifyMetrics.recordSessionEvent("created", "")
 
 	log.Info("created raw raknetify session", "clientAddr", clientAddr, "backendAddr", backendAddr)
+	go s.copyClientToBackend(session)
 	go s.copyBackendToClient(session)
 	return session, nil
 }
@@ -312,6 +335,20 @@ func (s *rawRaknetifyServer) migrateSessionClient(session *rawRaknetifySession, 
 		s.sessions.CompareAndDelete(oldKey, session)
 	}
 	return oldKey, newKey, true
+}
+
+func (s *rawRaknetifyServer) copyClientToBackend(session *rawRaknetifySession) {
+	for packet := range session.toBackend {
+		if session.writeDeadline > 0 {
+			_ = session.backendConn.SetWriteDeadline(time.Now().Add(session.writeDeadline))
+		}
+		if _, err := session.backendConn.Write(packet); err != nil {
+			rawRaknetifyMetrics.recordWriteFailure("client_to_backend", "write_error")
+			s.log.V(1).Info("raw raknetify backend write failed, closing session", "clientAddr", session.currentClientAddr(), "backendAddr", session.backendConn.RemoteAddr(), "error", err)
+			s.closeSession(session, "backend_write_error")
+			return
+		}
+	}
 }
 
 func (s *rawRaknetifyServer) copyBackendToClient(session *rawRaknetifySession) {
