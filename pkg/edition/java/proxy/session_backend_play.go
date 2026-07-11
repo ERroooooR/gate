@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"time"
 
 	"github.com/go-logr/logr"
 	"go.minekube.com/gate/pkg/edition/java/proto/packet/chat"
@@ -144,7 +143,7 @@ func (b *backendPlaySessionHandler) Disconnected() {
 }
 
 func (b *backendPlaySessionHandler) handleKeepAlive(p *packet.KeepAlive, pc *proto.PacketContext) {
-	b.serverConn.pendingPings.Set(p.RandomID, time.Now())
+	recordBackendKeepAlive(b.serverConn, p)
 	b.forwardToPlayer(pc, nil) // forward on
 }
 
@@ -371,13 +370,30 @@ func handleResourcePacketRequest_(
 }
 
 func (b *backendPlaySessionHandler) handleRemoveResourcePack(p *packet.RemoveResourcePack) {
-	handler := b.serverConn.player.resourcePackHandler
+	if handleRemoveResourcePack(p, b.serverConn, b.proxy().Event()) {
+		b.forwardToPlayer(nil, p)
+	}
+}
+
+func handleRemoveResourcePack(
+	p *packet.RemoveResourcePack,
+	serverConn *serverConnection,
+	eventMgr event.Manager,
+) bool {
+	e := newServerResourcePackRemoveEvent(p.ID, serverConn)
+	eventMgr.Fire(e)
+
+	if netmc.Closed(serverConn.player) || !e.Allowed() {
+		return false
+	}
+
+	handler := serverConn.player.resourcePackHandler
 	if p.ID != uuid.Nil {
 		handler.Remove(p.ID)
 	} else {
 		handler.ClearAppliedResourcePacks()
 	}
-	b.forwardToPlayer(nil, p)
+	return true
 }
 
 func (b *backendPlaySessionHandler) handleTransfer(p *packet.Transfer) {

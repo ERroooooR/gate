@@ -1,18 +1,235 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.minekube.com/common/minecraft/component"
 	"gopkg.in/yaml.v3"
 
 	bconfig "go.minekube.com/gate/pkg/edition/bedrock/config"
+	liteconfig "go.minekube.com/gate/pkg/edition/java/lite/config"
+	"go.minekube.com/gate/pkg/util/configutil"
 )
 
 func Test_texts(t *testing.T) {
 	require.NotNil(t, defaultMotd())
 	require.NotNil(t, defaultShutdownReason())
+}
+
+func TestStatusMotdAcceptsObjectRootComponent(t *testing.T) {
+	var cfg Config
+	require.NoError(t, yaml.Unmarshal([]byte(`
+status:
+  motd: '{"fallback":"diamond","sprite":"minecraft:item/diamond"}'
+`), &cfg))
+
+	require.IsType(t, &component.Object{}, cfg.Status.Motd.C())
+}
+
+func TestViaConfigValidate(t *testing.T) {
+	cfg := DefaultConfig
+	cfg.Servers = map[string]string{"Lobby": "127.0.0.1:25566"}
+	cfg.Try = []string{"Lobby"}
+	cfg.Via = Via{
+		Enabled: true,
+		Mode:    "embedded",
+	}
+
+	_, errs := cfg.Validate()
+	require.Empty(t, errs)
+}
+
+func TestViaConfigHasNoBackendOverrideSetting(t *testing.T) {
+	typ := reflect.TypeOf(Via{})
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		yamlName, _, _ := strings.Cut(field.Tag.Get("yaml"), ",")
+		require.NotEqual(t, "backends", yamlName, "via config should stay automatic and not expose per-backend overrides")
+	}
+}
+
+func TestViaConfigRejectsInvalidMode(t *testing.T) {
+	cfg := DefaultConfig
+	cfg.Servers = map[string]string{"lobby": "127.0.0.1:25566"}
+	cfg.Try = []string{"lobby"}
+	cfg.Via = Via{
+		Enabled: true,
+		Mode:    "native",
+	}
+
+	_, errs := cfg.Validate()
+	require.NotEmpty(t, errs)
+}
+
+func TestViaConfigRejectsInvalidBind(t *testing.T) {
+	cfg := DefaultConfig
+	cfg.Servers = map[string]string{"lobby": "127.0.0.1:25566"}
+	cfg.Try = []string{"lobby"}
+	cfg.Via = Via{
+		Enabled: true,
+		Bind:    "127.0.0.1",
+	}
+
+	_, errs := cfg.Validate()
+	require.NotEmpty(t, errs)
+}
+
+func TestViaConfigIgnoredInLiteMode(t *testing.T) {
+	cfg := DefaultConfig
+	cfg.Lite = liteconfig.Config{
+		Enabled: true,
+		Routes: []liteconfig.Route{{
+			Host:    []string{"example.com"},
+			Backend: []string{"127.0.0.1:25566"},
+		}},
+	}
+	cfg.Via = Via{
+		Enabled: true,
+	}
+
+	_, errs := cfg.Validate()
+	require.Empty(t, errs)
+}
+
+func TestBackendFloodgateValidation(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg := DefaultConfig
+		cfg.Forwarding.Mode = NoneForwardingMode
+		cfg.Servers = map[string]string{"lobby": "127.0.0.1:25566"}
+		cfg.Try = []string{"lobby"}
+
+		_, errs := cfg.Validate()
+		require.Empty(t, errs)
+	})
+
+	t.Run("enabled requires bedrock", func(t *testing.T) {
+		cfg := validBackendFloodgateConfig(t)
+		cfg.Bedrock.Enabled = false
+
+		_, errs := cfg.Validate()
+		requireErrorContains(t, errs, "bedrock.backendFloodgate requires bedrock.enabled")
+	})
+
+	t.Run("enabled requires bedrock in lite mode", func(t *testing.T) {
+		cfg := validBackendFloodgateConfig(t)
+		cfg.Lite = liteconfig.Config{
+			Enabled: true,
+			Routes: []liteconfig.Route{{
+				Host:    []string{"example.com"},
+				Backend: []string{"127.0.0.1:25566"},
+			}},
+		}
+		cfg.Bedrock.Enabled = false
+
+		_, errs := cfg.Validate()
+		requireErrorContains(t, errs, "bedrock.backendFloodgate requires bedrock.enabled")
+	})
+
+	t.Run("enabled requires allowed servers", func(t *testing.T) {
+		cfg := validBackendFloodgateConfig(t)
+		cfg.Bedrock.BackendFloodgate.AllowedServers = nil
+
+		_, errs := cfg.Validate()
+		requireErrorContains(t, errs, "bedrock.backendFloodgate.allowedServers must not be empty")
+	})
+
+	t.Run("allowed servers must exist", func(t *testing.T) {
+		cfg := validBackendFloodgateConfig(t)
+		cfg.Bedrock.BackendFloodgate.AllowedServers = []string{"missing"}
+
+		_, errs := cfg.Validate()
+		requireErrorContains(t, errs, `bedrock.backendFloodgate.allowedServers server "missing" must be registered under servers`)
+	})
+
+	t.Run("allowed servers are case-normalized", func(t *testing.T) {
+		cfg := validBackendFloodgateConfig(t)
+		cfg.Bedrock.BackendFloodgate.AllowedServers = []string{"Lobby"}
+
+		_, errs := cfg.Validate()
+		require.Empty(t, errs)
+	})
+
+	t.Run("enabled requires floodgate key unless managed can generate it", func(t *testing.T) {
+		cfg := validBackendFloodgateConfig(t)
+		cfg.Bedrock.FloodgateKeyPath = filepath.Join(t.TempDir(), "missing.key")
+
+		_, errs := cfg.Validate()
+		requireErrorContains(t, errs, "bedrock.backendFloodgate requires readable floodgateKeyPath")
+
+		cfg.Bedrock.Managed = bconfig.BoolOrManagedGeyser{}
+		cfg.Bedrock.Managed = configutil.NewBoolOrStructBool[bconfig.ManagedGeyser](true)
+		_, errs = cfg.Validate()
+		require.Empty(t, errs)
+	})
+
+	t.Run("forwarding mode compatibility", func(t *testing.T) {
+		for _, mode := range []ForwardingMode{NoneForwardingMode, VelocityForwardingMode} {
+			cfg := validBackendFloodgateConfig(t)
+			cfg.Forwarding.Mode = mode
+			_, errs := cfg.Validate()
+			require.Empty(t, errs, "mode %q should be allowed", mode)
+		}
+
+		for _, mode := range []ForwardingMode{LegacyForwardingMode, BungeeGuardForwardingMode} {
+			cfg := validBackendFloodgateConfig(t)
+			cfg.Forwarding.Mode = mode
+			_, errs := cfg.Validate()
+			requireErrorContains(t, errs, "bedrock.backendFloodgate is incompatible with forwarding.mode")
+		}
+	})
+
+	t.Run("unknown forwarding mode is rejected in lite mode", func(t *testing.T) {
+		cfg := validBackendFloodgateConfig(t)
+		cfg.Lite = liteconfig.Config{
+			Enabled: true,
+			Routes: []liteconfig.Route{{
+				Host:    []string{"example.com"},
+				Backend: []string{"127.0.0.1:25566"},
+			}},
+		}
+		cfg.Forwarding.Mode = "typo"
+
+		_, errs := cfg.Validate()
+		requireErrorContains(t, errs, "bedrock.backendFloodgate requires forwarding.mode none or velocity")
+	})
+}
+
+func validBackendFloodgateConfig(t *testing.T) Config {
+	t.Helper()
+
+	keyPath := filepath.Join(t.TempDir(), "floodgate.key")
+	require.NoError(t, os.WriteFile(keyPath, []byte("0123456789abcdef"), 0o600))
+
+	cfg := DefaultConfig
+	cfg.Forwarding.Mode = NoneForwardingMode
+	cfg.Servers = map[string]string{
+		"lobby":    "127.0.0.1:25566",
+		"survival": "127.0.0.1:25567",
+	}
+	cfg.Try = []string{"lobby"}
+	cfg.Bedrock.Enabled = true
+	cfg.Bedrock.FloodgateKeyPath = keyPath
+	cfg.Bedrock.BackendFloodgate = bconfig.BackendFloodgate{
+		Enabled:        true,
+		AllowedServers: []string{"lobby"},
+	}
+	return cfg
+}
+
+func requireErrorContains(t *testing.T, errs []error, want string) {
+	t.Helper()
+	for _, err := range errs {
+		if strings.Contains(err.Error(), want) {
+			return
+		}
+	}
+	t.Fatalf("expected error containing %q, got %v", want, errs)
 }
 
 func TestBedrockConfig_ManagedShorthand(t *testing.T) {
@@ -43,6 +260,106 @@ bedrock:
 
 	if !cfg.Bedrock.Managed.IsBool() || !cfg.Bedrock.Managed.BoolValue() {
 		t.Errorf("Expected Bedrock.Managed to be true, got %v", cfg.Bedrock.Managed.BoolValue())
+	}
+}
+
+func TestBedrockConfig_TopLevelBoolEnablesManagedGeyserlite(t *testing.T) {
+	yamlConfig := `
+bedrock: true
+`
+
+	type testConfig struct {
+		Bedrock bconfig.BedrockConfig `yaml:"bedrock"`
+	}
+
+	var cfg testConfig
+	if err := yaml.Unmarshal([]byte(yamlConfig), &cfg); err != nil {
+		t.Fatalf("Failed to unmarshal config: %v", err)
+	}
+
+	if !cfg.Bedrock.Enabled {
+		t.Fatal("Expected Bedrock.Enabled to be true when bedrock: true")
+	}
+	if cfg.Bedrock.Managed.IsNil() {
+		t.Fatal("Expected Bedrock.Managed to be set when bedrock: true")
+	}
+	if !cfg.Bedrock.Managed.IsBool() || !cfg.Bedrock.Managed.BoolValue() {
+		t.Fatalf("Expected Bedrock.Managed to be true, got %v", cfg.Bedrock.Managed)
+	}
+
+	bedrockConfig := cfg.Bedrock.ToConfig()
+	managedConfig := bedrockConfig.GetManaged()
+	if !managedConfig.Enabled {
+		t.Fatal("Expected resolved managed config to be enabled")
+	}
+	if managedConfig.Engine != bconfig.ManagedEngineGeyserlite {
+		t.Fatalf("Expected bedrock: true to default to geyserlite engine, got %q", managedConfig.Engine)
+	}
+}
+
+func TestBedrockConfig_ManagedJavaEngine(t *testing.T) {
+	yamlConfig := `
+bedrock:
+  managed:
+    enabled: true
+    engine: java
+`
+
+	type testConfig struct {
+		Bedrock bconfig.BedrockConfig `yaml:"bedrock"`
+	}
+
+	var cfg testConfig
+	if err := yaml.Unmarshal([]byte(yamlConfig), &cfg); err != nil {
+		t.Fatalf("Failed to unmarshal config: %v", err)
+	}
+
+	bedrockConfig := cfg.Bedrock.ToConfig()
+	managedConfig := bedrockConfig.GetManaged()
+	if managedConfig.Engine != bconfig.ManagedEngineJava {
+		t.Fatalf("Expected managed engine java, got %q", managedConfig.Engine)
+	}
+}
+
+func TestBedrockConfig_ManagedNestedEngineConfig(t *testing.T) {
+	yamlConfig := `
+bedrock:
+  managed:
+    enabled: true
+    engine: geyserlite
+    geyserlite:
+      mode: embedded
+      version: v0.2.1
+    java:
+      dataDir: /srv/geyser
+      autoUpdate: false
+`
+
+	type testConfig struct {
+		Bedrock bconfig.BedrockConfig `yaml:"bedrock"`
+	}
+
+	var cfg testConfig
+	if err := yaml.Unmarshal([]byte(yamlConfig), &cfg); err != nil {
+		t.Fatalf("Failed to unmarshal config: %v", err)
+	}
+
+	bedrockConfig := cfg.Bedrock.ToConfig()
+	managedConfig := bedrockConfig.GetManaged()
+	if managedConfig.Engine != bconfig.ManagedEngineGeyserlite {
+		t.Fatalf("Expected managed engine geyserlite, got %q", managedConfig.Engine)
+	}
+	if managedConfig.Mode != "embedded" {
+		t.Fatalf("Expected geyserlite mode embedded, got %q", managedConfig.Mode)
+	}
+	if managedConfig.Version != "v0.2.1" {
+		t.Fatalf("Expected geyserlite version v0.2.1, got %q", managedConfig.Version)
+	}
+	if managedConfig.DataDir != bconfig.DefaultManaged.DataDir {
+		t.Fatalf("Expected inactive java dataDir to be ignored, got %q", managedConfig.DataDir)
+	}
+	if !managedConfig.AutoUpdate {
+		t.Fatal("Expected inactive java autoUpdate false to be ignored")
 	}
 }
 

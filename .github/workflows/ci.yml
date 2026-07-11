@@ -1,6 +1,7 @@
 name: ci
 on:
   push:
+  workflow_dispatch:
   pull_request:
     types: [opened, reopened]
 
@@ -11,23 +12,27 @@ permissions:
 env:
   REGISTRY: ghcr.io
 
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
-          args: --timeout 3m0s
+        run: golangci-lint run --timeout 3m0s
   test:
     strategy:
       fail-fast: false
@@ -36,28 +41,106 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go with cache
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           cache: true
           go-version-file: go.mod
 
       - name: Test
         run: make test
+
+      - name: Smoke test - Geyserlite Windows auto-download starts
+        if: matrix.platform == 'windows-latest'
+        run: go test ./pkg/edition/bedrock/geyser -tags=geyserlite_smoke -run TestLiteManagedRunnerWindowsAutoDownloadSmoke -count=1 -timeout 6m -v
+  # Regression test for https://github.com/minekube/gate/issues/697:
+  # The published images crashed with "exec /gate: no such file or directory"
+  # because the gate binary is dynamically linked (the geyserlite dependency
+  # pulls in github.com/ebitengine/purego, which imports libdl.so.2 via
+  # //go:cgo_import_dynamic even with CGO_ENABLED=0) but the runtime base image
+  # had no glibc dynamic loader. This job builds the actual images and runs the
+  # binary and starts managed Bedrock on both architectures so broken runtime
+  # dependencies or cache paths fail CI instead of shipping.
+  docker-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build gate image (host arch, load)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          target: gate
+          build-args: |
+            VERSION=smoke-test
+          tags: gate:smoke
+
+      - name: Smoke test - gate binary execs in distroless image
+        run: |
+          out="$(docker run --rm gate:smoke --version)"
+          echo "$out"
+          echo "$out" | grep -q "gate version smoke-test"
+
+      - name: Smoke test - managed Bedrock starts in read-only distroless image
+        run: |
+          cid=$(docker run -d --read-only --tmpfs /tmp \
+            -v "$PWD/.github/testdata/managed-bedrock.yml:/config.yml:ro" \
+            gate:smoke --config /config.yml)
+          trap 'docker logs "$cid" 2>&1 || true; docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+
+          for _ in $(seq 1 180); do
+            logs=$(docker logs "$cid" 2>&1)
+            if grep -q "geyser integration started" <<<"$logs"; then
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' "$cid")" != "true" ]; then
+              exit 1
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Build jre variant image (host arch, load)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          target: jre
+          build-args: |
+            VERSION=smoke-test
+          tags: gate-jre:smoke
+
+      - name: Smoke test - gate binary execs in jre image
+        run: |
+          out="$(docker run --rm gate-jre:smoke --version)"
+          echo "$out"
+          echo "$out" | grep -q "gate version smoke-test"
   build:
-    if: ( github.event_name == 'push' && ( github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/') ) )
+    if: ( github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/') ) || ( github.event_name == 'push' && ( github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/') ) )
     needs:
       - lint
       - test
+      - docker-smoke
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.image-ref.outputs.image }}
       image_latest: ${{ steps.image-ref.outputs.image_latest }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -77,10 +160,10 @@ jobs:
           path: dist/gate
 
       - name: Set up docker buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to Container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -123,7 +206,7 @@ jobs:
           echo "Version: ${VERSION}" >> $GITHUB_STEP_SUMMARY
 
       - name: Build and push docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -140,7 +223,7 @@ jobs:
             ${{ steps.image-ref.outputs.image_version }}
 
       - name: Build and push docker image (jre variant)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -162,18 +245,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           cache: true
           go-version-file: go.mod
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           version: latest
           args: release --clean

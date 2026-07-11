@@ -11,15 +11,15 @@ repositories {
     }
 }
 
-val grpcVersion = "1.78.0"
+val grpcVersion = "1.82.1"
 val grpcKotlinVersion = "1.5.0"
 val connectVersion = "0.7.1"
-val protobufVersion = "4.33.4"
+val protobufVersion = "4.35.1"
 
 dependencies {
     // Kotlin
     implementation(kotlin("stdlib"))
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 
     // Connect-RPC
     implementation("build.buf.gen:minekube_gate_connectrpc_kotlin:${connectVersion}.1.20241118150055.50fffb007499")

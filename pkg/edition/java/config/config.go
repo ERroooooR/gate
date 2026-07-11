@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -58,6 +59,11 @@ var DefaultConfig = Config{
 			MaxEntries: 1000,
 		},
 	},
+	PacketLimiter: PacketLimiter{
+		Interval:         configutil.Duration(7 * time.Second),
+		PacketsPerSecond: 500,
+		BytesPerSecond:   -1, // disabled by default; packet-rate limiting is enough for most setups
+	},
 	Compression: Compression{
 		Threshold: 256,
 		Level:     -1,
@@ -77,8 +83,8 @@ var DefaultConfig = Config{
 	Bedrock:                             bconfig.DefaultBedrockConfig,
 }
 
-func defaultMotd() *configutil.TextComponent {
-	return text("§bA Gate Proxy\n§bVisit ➞ §fgithub.com/minekube/gate")
+func defaultMotd() *configutil.Component {
+	return componentText("§bA Gate Proxy\n§bVisit ➞ §fgithub.com/minekube/gate")
 }
 func defaultShutdownReason() *configutil.TextComponent {
 	return text("§cGate proxy is shutting down...\nPlease reconnect in a moment!")
@@ -107,11 +113,12 @@ type Config struct { // TODO use https://github.com/projectdiscovery/yamldoc-go 
 	ConnectionTimeout configutil.Duration `yaml:"connectionTimeout,omitempty" json:"connectionTimeout,omitempty"` // Write timeout
 	ReadTimeout       configutil.Duration `yaml:"readTimeout,omitempty" json:"readTimeout,omitempty"`             // Read timeout
 
-	Quota                Quota       `yaml:"quota,omitempty" json:"quota,omitempty"` // Rate limiting settings
-	Compression          Compression `yaml:"compression,omitempty" json:"compression,omitempty"`
-	ProxyProtocol        bool        `yaml:"proxyProtocol,omitempty" json:"proxyProtocol,omitempty"`     // Enable HA-Proxy protocol mode
-	ProxyProtocolBackend bool        `yaml:"proxyProtocolBackend" json:"proxyProtocolBackend,omitempty"` // Enable HA-Proxy protocol mode for backend servers
-	TCPBrutal            TCPBrutal   `yaml:"tcpBrutal,omitempty" json:"tcpBrutal,omitempty"`             // TCP Brutal congestion control settings
+	Quota                Quota         `yaml:"quota,omitempty" json:"quota,omitempty"`                 // Rate limiting settings
+	PacketLimiter        PacketLimiter `yaml:"packetLimiter,omitempty" json:"packetLimiter,omitempty"` // Per-connection serverbound packet rate limiting
+	Compression          Compression   `yaml:"compression,omitempty" json:"compression,omitempty"`
+	ProxyProtocol        bool          `yaml:"proxyProtocol,omitempty" json:"proxyProtocol,omitempty"`     // Enable HA-Proxy protocol mode
+	ProxyProtocolBackend bool          `yaml:"proxyProtocolBackend" json:"proxyProtocolBackend,omitempty"` // Enable HA-Proxy protocol mode for backend servers
+	TCPBrutal            TCPBrutal     `yaml:"tcpBrutal,omitempty" json:"tcpBrutal,omitempty"`             // TCP Brutal congestion control settings
 
 	ShouldPreventClientProxyConnections bool `yaml:"shouldPreventClientProxyConnections" json:"shouldPreventClientProxyConnections,omitempty"` // Sends player IP to Mojang on login
 
@@ -126,6 +133,7 @@ type Config struct { // TODO use https://github.com/projectdiscovery/yamldoc-go 
 	ShutdownReason *configutil.TextComponent `yaml:"shutdownReason,omitempty" json:"shutdownReason,omitempty"`
 
 	Lite liteconfig.Config `yaml:"lite,omitempty" json:"lite,omitempty"` // Lite mode settings
+	Via  Via               `yaml:"via,omitempty" json:"via,omitempty"`   // Via backend compatibility settings
 
 	// Bedrock edition configuration
 	Bedrock bconfig.BedrockConfig `yaml:"bedrock,omitempty" json:"bedrock,omitempty"`
@@ -134,10 +142,10 @@ type Config struct { // TODO use https://github.com/projectdiscovery/yamldoc-go 
 type (
 	ForcedHosts map[string][]string // virtualhost:server names
 	Status      struct {
-		ShowMaxPlayers  int                       `yaml:"showMaxPlayers"`
-		Motd            *configutil.TextComponent `yaml:"motd"`
-		Favicon         favicon.Favicon           `yaml:"favicon"`
-		LogPingRequests bool                      `yaml:"logPingRequests"`
+		ShowMaxPlayers  int                   `yaml:"showMaxPlayers"`
+		Motd            *configutil.Component `yaml:"motd"`
+		Favicon         favicon.Favicon       `yaml:"favicon"`
+		LogPingRequests bool                  `yaml:"logPingRequests"`
 	}
 	Query struct {
 		Enabled     bool `yaml:"enabled"`
@@ -148,6 +156,16 @@ type (
 		Mode              ForwardingMode `yaml:"mode"`
 		VelocitySecret    string         `yaml:"velocitySecret"`    // Used with "velocity" mode
 		BungeeGuardSecret string         `yaml:"bungeeGuardSecret"` // Used with "bungeeguard" mode
+	}
+	Via struct {
+		Enabled     bool   `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+		Mode        string `yaml:"mode,omitempty" json:"mode,omitempty"`
+		Bind        string `yaml:"bind,omitempty" json:"bind,omitempty"`
+		LibraryPath string `yaml:"libraryPath,omitempty" json:"libraryPath,omitempty"`
+		BinaryPath  string `yaml:"binaryPath,omitempty" json:"binaryPath,omitempty"`
+		Version     string `yaml:"version,omitempty" json:"version,omitempty"`
+		Mirror      string `yaml:"mirror,omitempty" json:"mirror,omitempty"`
+		Offline     bool   `yaml:"offline,omitempty" json:"offline,omitempty"`
 	}
 	Compression struct {
 		Threshold int `yaml:"threshold"`
@@ -163,7 +181,15 @@ type (
 	Quota struct {
 		Connections QuotaSettings `yaml:"connections"` // Limits new connections per second, per IP block.
 		Logins      QuotaSettings `yaml:"logins"`      // Limits logins per second, per IP block.
-		// Maybe add a bytes-per-sec limiter, or should be managed by a higher layer.
+	}
+	// PacketLimiter limits how many serverbound packets/bytes a single connection
+	// may send over a sliding window, mitigating packet floods from already
+	// connected clients (the Quota limits only apply at connect/login time).
+	// A limit <= 0 disables that dimension; if both are <= 0 the limiter is off.
+	PacketLimiter struct {
+		Interval         configutil.Duration `yaml:"interval"`         // Sliding window the rates are measured over.
+		PacketsPerSecond int                 `yaml:"packetsPerSecond"` // Max serverbound packets/s per connection (<=0 disables).
+		BytesPerSecond   int                 `yaml:"bytesPerSecond"`   // Max serverbound bytes/s per connection (<=0 disables).
 	}
 	QuotaSettings struct {
 		Enabled    bool    `yaml:"enabled"`    // If false, there is no such limiting.
@@ -250,9 +276,19 @@ func (c *Config) Validate() (warns []error, errs []error) {
 		w("TCP Brutal is enabled but both downMbps and upMbps are zero; no TCP sockets will be changed")
 	}
 
-	if c.Lite.Enabled {
-		return c.Lite.Validate()
+	if pl := c.PacketLimiter; (pl.PacketsPerSecond > 0 || pl.BytesPerSecond > 0) && pl.Interval <= 0 {
+		w("Packet limiter has a rate set but interval <= 0; the limiter is disabled. Set packetLimiter.interval > 0 to enable it.")
 	}
+
+	validateBackendFloodgate(c, e)
+	if c.Lite.Enabled {
+		warns2, errs2 := c.Lite.Validate()
+		warns = append(warns, warns2...)
+		errs = append(errs, errs2...)
+		return
+	}
+
+	validateVia(c, e)
 
 	if !c.OnlineMode {
 		w("Proxy is running in offline mode!")
@@ -311,9 +347,85 @@ func (c *Config) Validate() (warns []error, errs []error) {
 	return
 }
 
+func validateBackendFloodgate(c *Config, e func(string, ...any)) {
+	backendFloodgate := c.Bedrock.BackendFloodgate
+	if !backendFloodgate.Enabled {
+		return
+	}
+	if !c.Bedrock.Enabled {
+		e("bedrock.backendFloodgate requires bedrock.enabled")
+	}
+	if len(backendFloodgate.AllowedServers) == 0 {
+		e("bedrock.backendFloodgate.allowedServers must not be empty")
+	}
+
+	servers := make(map[string]struct{}, len(c.Servers))
+	for name := range c.Servers {
+		servers[strings.ToLower(name)] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(backendFloodgate.AllowedServers))
+	for _, name := range backendFloodgate.AllowedServers {
+		if !validation.ValidServerName(name) {
+			e("Invalid bedrock.backendFloodgate.allowedServers server name %q: %s and length be 1-%d", name,
+				validation.QualifiedNameErrMsg, validation.QualifiedNameMaxLength)
+			continue
+		}
+		normalized := strings.ToLower(name)
+		if _, ok := seen[normalized]; ok {
+			e("Duplicate bedrock.backendFloodgate.allowedServers server %q", name)
+			continue
+		}
+		seen[normalized] = struct{}{}
+		if _, ok := servers[normalized]; !ok {
+			e("bedrock.backendFloodgate.allowedServers server %q must be registered under servers", name)
+		}
+	}
+
+	switch c.Forwarding.Mode {
+	case NoneForwardingMode, VelocityForwardingMode:
+	case LegacyForwardingMode, BungeeGuardForwardingMode:
+		e("bedrock.backendFloodgate is incompatible with forwarding.mode %q", c.Forwarding.Mode)
+	default:
+		e("bedrock.backendFloodgate requires forwarding.mode none or velocity, got %q", c.Forwarding.Mode)
+	}
+
+	bedrockConfig := c.Bedrock.ToConfig()
+	if bedrockConfig.FloodgateKeyPath == "" {
+		e("bedrock.backendFloodgate requires readable floodgateKeyPath")
+		return
+	}
+	if _, err := os.ReadFile(bedrockConfig.FloodgateKeyPath); err != nil {
+		if os.IsNotExist(err) && bedrockConfig.GetManaged().Enabled {
+			return
+		}
+		e("bedrock.backendFloodgate requires readable floodgateKeyPath %q: %v", bedrockConfig.FloodgateKeyPath, err)
+	}
+}
+
+func validateVia(c *Config, e func(string, ...any)) {
+	if !c.Via.Enabled {
+		return
+	}
+	switch c.Via.Mode {
+	case "", "embedded", "subprocess":
+	default:
+		e("Unknown via mode %q, must be one of embedded,subprocess", c.Via.Mode)
+	}
+	if c.Via.Bind != "" {
+		if err := validation.ValidHostPort(c.Via.Bind); err != nil {
+			e("Invalid via bind %q: %v", c.Via.Bind, err)
+		}
+	}
+}
+
 func text(s string) *configutil.TextComponent {
 	return (*configutil.TextComponent)(must(componentutil.ParseTextComponent(
 		version.MinimumVersion.Protocol, s)))
+}
+
+func componentText(s string) *configutil.Component {
+	return &configutil.Component{Value: must(componentutil.ParseComponent(
+		version.MaximumVersion.Protocol, s))}
 }
 
 func must[T any](t T, err error) T {

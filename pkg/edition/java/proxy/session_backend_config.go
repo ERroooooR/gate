@@ -3,7 +3,6 @@ package proxy
 import (
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/robinbraemer/event"
@@ -16,7 +15,6 @@ import (
 	"go.minekube.com/gate/pkg/edition/java/proto/version"
 	"go.minekube.com/gate/pkg/edition/java/proxy/tablist"
 	"go.minekube.com/gate/pkg/gate/proto"
-	"go.minekube.com/gate/pkg/util/uuid"
 )
 
 // backendConfigSessionHandler is a special session handler that catches "last minute" disconnects.
@@ -137,14 +135,9 @@ func (b *backendConfigSessionHandler) handleResourcePackRequest(p *packet.Resour
 func (b *backendConfigSessionHandler) handleRemoveResourcePackRequest(p *packet.RemoveResourcePack) {
 	player := b.serverConn.player
 
-	// TODO add ServerResourcePackRemoveEvent
-	handler := player.resourcePackHandler
-	if p.ID != uuid.Nil {
-		handler.Remove(p.ID)
-	} else {
-		handler.ClearAppliedResourcePacks()
+	if handleRemoveResourcePack(p, b.serverConn, b.proxy().Event()) {
+		_ = player.WritePacket(p)
 	}
-	_ = player.WritePacket(p)
 }
 
 func (b *backendConfigSessionHandler) handleFinishedUpdate(p *config.FinishedUpdate) {
@@ -248,7 +241,7 @@ func (b *backendConfigSessionHandler) handlePluginMessage(pc *proto.PacketContex
 }
 
 func (b *backendConfigSessionHandler) handleKeepAlive(p *packet.KeepAlive) {
-	b.serverConn.pendingPings.Set(p.RandomID, time.Now())
+	recordBackendKeepAlive(b.serverConn, p)
 	_ = b.serverConn.player.WritePacket(p)
 }
 
