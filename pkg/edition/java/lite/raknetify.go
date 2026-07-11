@@ -110,7 +110,7 @@ func handleRaknetifyConn(ctx context.Context, log logr.Logger, opts RaknetifyOpt
 	}
 	base := newRaknetifyConn(packetConn)
 	connCtx := logr.NewContext(ctx, log.WithValues("clientAddr", raw.RemoteAddr()))
-	client, startReadLoop := netmc.NewMinecraftConn(connCtx, base, proto.ServerBound, opts.ReadTimeout, opts.WriteTimeout, opts.CompressionLevel)
+	client, startReadLoop := netmc.NewMinecraftConn(connCtx, base, proto.ServerBound, opts.ReadTimeout, opts.WriteTimeout, opts.CompressionLevel, nil)
 	client.SetActiveSessionHandler(state.Handshake, &raknetifyHandshakeHandler{
 		conn: client,
 		opts: opts,
