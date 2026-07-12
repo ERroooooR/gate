@@ -43,8 +43,8 @@ func apply(conn net.Conn, options Options) error {
 			Rate:     options.RateBytesPerSecond,
 			CwndGain: options.CwndGain,
 		}
-		_, _, errno := syscall.Syscall6(
-			syscall.SYS_SETSOCKOPT,
+		_, _, errno := unix.Syscall6(
+			unix.SYS_SETSOCKOPT,
 			fd,
 			uintptr(syscall.IPPROTO_TCP),
 			uintptr(ParamsSockopt),

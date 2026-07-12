@@ -68,7 +68,20 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - name: Check GitHub App configured
+        id: check
+        run: |
+          if [ -n "$APP_ID" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::RELEASE_CASCADE_APP_ID not set, skipping cross-repo dispatch"
+          fi
+        env:
+          APP_ID: ${{ vars.RELEASE_CASCADE_APP_ID }}
+
       - name: Create GitHub App token
+        if: steps.check.outputs.configured == 'true'
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
@@ -79,6 +92,7 @@ jobs:
           permission-actions: write
 
       - name: Dispatch bump-gate workflow
+        if: steps.check.outputs.configured == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           INPUTS_JSON: |
