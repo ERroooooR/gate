@@ -63,18 +63,36 @@ jobs:
   dispatch-moxy-bump:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
-    uses: minekube/actions/.github/workflows/dispatch-workflow.yml@v1
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
-    with:
-      target-repository: moxy
-      target-workflow: bump-gate.yml
-      target-ref: main
-      inputs-json: |
-        {
-          "version": "${{ needs.release-please.outputs.tag_name }}",
-          "source_repository": "${{ github.repository }}",
-          "source_release_url": "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.release-please.outputs.tag_name }}"
-        }
-    secrets: inherit
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.RELEASE_CASCADE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_CASCADE_APP_PRIVATE_KEY }}
+          owner: minekube
+          repositories: moxy
+          permission-actions: write
+
+      - name: Dispatch bump-gate workflow
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          INPUTS_JSON: |
+            {
+              "version": "${{ needs.release-please.outputs.tag_name }}",
+              "source_repository": "${{ github.repository }}",
+              "source_release_url": "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.release-please.outputs.tag_name }}"
+            }
+        run: |
+          jq -n \
+            --arg ref main \
+            --argjson inputs "$INPUTS_JSON" \
+            '{ref: $ref, inputs: $inputs}' |
+            gh api \
+              --method POST \
+              repos/minekube/moxy/actions/workflows/bump-gate.yml/dispatches \
+              --input -
