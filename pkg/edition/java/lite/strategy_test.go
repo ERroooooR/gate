@@ -100,7 +100,7 @@ func TestConfigValidation_ValidStrategies(t *testing.T) {
 	}
 }
 
-func TestConfigValidation_AllowsRaknetifyPassthroughWithProxyProtocol(t *testing.T) {
+func TestConfigValidation_RejectsRemovedRaknetifyPassthroughMode(t *testing.T) {
 	cfg := config.Config{
 		Routes: []config.Route{
 			{
@@ -109,15 +109,15 @@ func TestConfigValidation_AllowsRaknetifyPassthroughWithProxyProtocol(t *testing
 				ProxyProtocol: true,
 				Raknetify: config.RaknetifyConfig{
 					Enabled: true,
-					Mode:    config.RaknetifyModePassthrough,
+					Mode:    config.RaknetifyMode("passthrough"),
 				},
 			},
 		},
 	}
 
-	warns, errs := cfg.Validate()
-	assert.Empty(t, warns, "Should have no warnings")
-	assert.Empty(t, errs, "Raknetify passthrough should allow proxyProtocol for TCP-only use")
+	_, errs := cfg.Validate()
+	assert.Len(t, errs, 1)
+	assert.Contains(t, errs[0].Error(), "invalid raknetify mode")
 }
 
 func TestConfigValidation_RawRaknetifyQoS(t *testing.T) {

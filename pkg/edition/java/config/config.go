@@ -275,6 +275,12 @@ func (c *Config) Validate() (warns []error, errs []error) {
 	if c.TCPBrutal.Enabled && c.TCPBrutal.DownMbps == 0 && c.TCPBrutal.UpMbps == 0 {
 		w("TCP Brutal is enabled but both downMbps and upMbps are zero; no TCP sockets will be changed")
 	}
+	if c.TCPBrutal.Enabled {
+		gain := c.TCPBrutal.EffectiveCwndGain()
+		if gain < tcpbrutal.MinCwndGain || gain > tcpbrutal.MaxCwndGain {
+			e("TCP Brutal cwndGain must be between %d and %d", tcpbrutal.MinCwndGain, tcpbrutal.MaxCwndGain)
+		}
+	}
 
 	if pl := c.PacketLimiter; (pl.PacketsPerSecond > 0 || pl.BytesPerSecond > 0) && pl.Interval <= 0 {
 		w("Packet limiter has a rate set but interval <= 0; the limiter is disabled. Set packetLimiter.interval > 0 to enable it.")

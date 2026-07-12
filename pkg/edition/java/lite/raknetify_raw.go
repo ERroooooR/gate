@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -20,41 +22,47 @@ import (
 )
 
 const (
-	rawRaknetifyRouteHintPacketID = byte(0xfe)
-	rawRaknetifyRouteHintVersion  = byte(1)
-	rawRaknetifyRouteHintVersion2 = byte(2)
-	rawRaknetifyRouteTokenLen     = 16
-	rawRaknetifyMaxHintHostLen    = 1024
+	rawRaknetifyRouteHintPacketID  = byte(0xfe)
+	rawRaknetifyRouteHintVersion   = byte(1)
+	rawRaknetifyRouteHintVersion2  = byte(2)
+	rawRaknetifyRouteTokenLen      = 16
+	rawRaknetifyMaxHintHostLen     = 1024
 	rawRaknetifyDefaultIdleTimeout = time.Minute
-	rawRaknetifySweepInterval     = 15 * time.Second
-	rawRaknetifyMaxSessions       = 4096
-	rawRaknetifySocketBufferSize  = 4 * 1024 * 1024
-	rawRaknetifyDefaultIPTOS      = 0xA0
-	rawRaknetifyBackendQueueSize = 256
+	rawRaknetifySweepInterval      = 15 * time.Second
+	rawRaknetifyMaxSessions        = 4096
+	rawRaknetifySocketBufferSize   = 4 * 1024 * 1024
+	rawRaknetifyDefaultIPTOS       = 0xA0
 )
+
 var rawRaknetifyRouteHintMagic = []byte("GATE_RAKNET_ROUTE")
 
 type rawRaknetifySession struct {
-	host        string
-	routeToken  string
-	hasToken    bool
-	tokenKey    string
-	backendConn *net.UDPConn
-	decrement   func()
-	lastSeen    atomic.Int64
-	closeOnce   sync.Once
-	mu          sync.Mutex
-	clientAddr  net.Addr
-	clientKey   string
+	host             string
+	routeToken       string
+	hasToken         bool
+	tokenKey         string
+	backendConn      *net.UDPConn
+	decrement        func()
+	lastSeen         atomic.Int64
+	closeOnce        sync.Once
+	mu               sync.Mutex
+	clientAddr       net.Addr
+	clientKey        string
+	clientIPKey      string
+	clientTOS        int
+	maxSessionsPerIP int
+	routeFingerprint string
 	// idleTimeout is the per-session idle timeout derived from the route config.
 	// If the route has no configured IdleTimeout, rawRaknetifyDefaultIdleTimeout is used.
 	idleTimeout time.Duration
 	// writeDeadline is the per-session write deadline derived from the route config.
 	// 0 means no deadline.
-	writeDeadline time.Duration
-	toBackend   chan []byte
-	queueMu     sync.Mutex
-	closed      bool
+	writeDeadline  time.Duration
+	pacingInterval time.Duration
+	toBackend      chan []byte
+	done           chan struct{}
+	queueMu        sync.Mutex
+	closed         bool
 }
 
 func (s *rawRaknetifySession) touch(now time.Time) {
@@ -67,6 +75,7 @@ func (s *rawRaknetifySession) close() bool {
 		closed = true
 		s.queueMu.Lock()
 		s.closed = true
+		close(s.done)
 		if s.toBackend != nil {
 			close(s.toBackend)
 		}
@@ -120,13 +129,19 @@ func (s *rawRaknetifySession) enqueueToBackend(packet []byte) bool {
 	}
 }
 
+func (s *rawRaknetifySession) isClosed() bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	return s.closed
+}
+
 type rawRaknetifyRouteHint struct {
 	host     string
 	token    string
 	hasToken bool
 }
 
-func ServeRaknetifyRaw(ctx context.Context, opts RaknetifyOptions) error {
+func ServeRaknetifyRaw(ctx context.Context, opts RaknetifyRawOptions) error {
 	if opts.Routes == nil {
 		return fmt.Errorf("raknetify routes provider is nil")
 	}
@@ -175,6 +190,8 @@ type rawRaknetifyServer struct {
 	tosMu           sync.Mutex
 	clientTOS       int
 	migrationMu     sync.Mutex
+	quotaMu         sync.Mutex
+	sessionsPerIP   map[string]int
 }
 
 func (s *rawRaknetifyServer) serve(ctx context.Context) error {
@@ -233,24 +250,43 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 	}
 	key := clientAddr.String()
 	tokenKey := rawRaknetifyTokenKey(hint)
+	fingerprint, err := s.rawRouteFingerprint(hint.host)
+	if err != nil {
+		if tokenKey != "" {
+			if value, ok := s.tokenSessions.Load(tokenKey); ok {
+				if existing, ok := value.(*rawRaknetifySession); ok {
+					s.closeSession(existing, "route_removed")
+				}
+			}
+		} else if existing, ok := s.loadSession(clientAddr); ok {
+			s.closeSession(existing, "route_removed")
+		}
+		return nil, err
+	}
 	if tokenKey != "" {
 		if value, ok := s.tokenSessions.Load(tokenKey); ok {
-			if existing, ok := value.(*rawRaknetifySession); ok && strings.EqualFold(existing.host, hint.host) {
+			if existing, ok := value.(*rawRaknetifySession); ok && strings.EqualFold(existing.host, hint.host) && existing.routeFingerprint == fingerprint {
 				if current, ok := s.loadSession(clientAddr); ok && current != existing {
 					rawRaknetifyMetrics.recordSessionEvent("replaced", "migration_conflict")
 					s.closeSession(current, "migration_conflict")
 				}
-				if oldKey, newKey, migrated := s.migrateSessionClient(existing, clientAddr); migrated {
+				oldKey, newKey, migrated, migrateErr := s.migrateSessionClient(existing, clientAddr)
+				if migrateErr != nil {
+					return nil, migrateErr
+				}
+				if migrated {
 					rawRaknetifyMetrics.recordSessionEvent("migrated", "")
 					s.log.Info("migrated raw raknetify session", "oldClientAddr", oldKey, "clientAddr", newKey, "backendAddr", existing.backendConn.RemoteAddr())
 				}
 				existing.touch(time.Now())
 				return existing, nil
+			} else if ok {
+				s.closeSession(existing, "route_changed")
 			}
 		}
 	}
 	if existing, ok := s.loadSession(clientAddr); ok {
-		if strings.EqualFold(existing.host, hint.host) {
+		if strings.EqualFold(existing.host, hint.host) && existing.routeFingerprint == fingerprint {
 			if existing.hasToken && hint.hasToken && existing.routeToken != hint.token {
 			} else {
 				existing.touch(time.Now())
@@ -285,18 +321,38 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 	if raw.WriteTimeout > 0 {
 		sessionWriteDeadline = time.Duration(raw.WriteTimeout)
 	}
+	queueSize := raw.QueueSize
+	if queueSize == 0 {
+		queueSize = config.DefaultRawRaknetifyQueueSize
+	}
+	maxSessionsPerIP := raw.MaxSessionsPerIP
+	if maxSessionsPerIP == 0 {
+		maxSessionsPerIP = config.DefaultRawRaknetifySessionsPerIP
+	}
+	clientIPKey := rawRaknetifyClientIPKey(clientAddr)
+	if !s.reserveIPSession(clientIPKey, maxSessionsPerIP) {
+		_ = backendConn.Close()
+		rawRaknetifyMetrics.recordSessionEvent("rejected", "per_ip_limit")
+		return nil, fmt.Errorf("raw raknetify per-IP session limit reached for %s", clientIPKey)
+	}
 
 	session := &rawRaknetifySession{
-		host:           hint.host,
-		routeToken:     hint.token,
-		hasToken:       hint.hasToken,
-		tokenKey:       tokenKey,
-		backendConn:    backendConn,
-		clientAddr:     clientAddr,
-		clientKey:      key,
-		idleTimeout:    sessionIdleTimeout,
-		writeDeadline:  sessionWriteDeadline,
-		toBackend:      make(chan []byte, rawRaknetifyBackendQueueSize),
+		host:             hint.host,
+		routeToken:       hint.token,
+		hasToken:         hint.hasToken,
+		tokenKey:         tokenKey,
+		backendConn:      backendConn,
+		clientAddr:       clientAddr,
+		clientKey:        key,
+		idleTimeout:      sessionIdleTimeout,
+		writeDeadline:    sessionWriteDeadline,
+		pacingInterval:   time.Duration(raw.PacingInterval),
+		toBackend:        make(chan []byte, queueSize),
+		done:             make(chan struct{}),
+		clientIPKey:      clientIPKey,
+		clientTOS:        rawRaknetifyQOSTOSForRoute(route),
+		maxSessionsPerIP: maxSessionsPerIP,
+		routeFingerprint: fingerprint,
 	}
 	if route.Strategy == config.StrategyLeastConnections {
 		session.decrement = s.strategyManager.IncrementConnection(backendKey)
@@ -316,13 +372,27 @@ func (s *rawRaknetifyServer) ensureSession(clientAddr net.Addr, hint rawRaknetif
 	return session, nil
 }
 
-func (s *rawRaknetifyServer) migrateSessionClient(session *rawRaknetifySession, clientAddr net.Addr) (oldKey, newKey string, migrated bool) {
+func (s *rawRaknetifyServer) migrateSessionClient(session *rawRaknetifySession, clientAddr net.Addr) (oldKey, newKey string, migrated bool, err error) {
 	s.migrationMu.Lock()
 	defer s.migrationMu.Unlock()
+	if session.isClosed() {
+		return session.currentClientKey(), clientAddr.String(), false, errors.New("raw raknetify session is closed")
+	}
+	newIPKey := rawRaknetifyClientIPKey(clientAddr)
+	if newIPKey != session.clientIPKey && !s.reserveIPSession(newIPKey, session.maxSessionsPerIP) {
+		return session.currentClientKey(), clientAddr.String(), false, fmt.Errorf("raw raknetify per-IP session limit reached for %s", newIPKey)
+	}
 
 	oldKey, newKey, migrated = session.setClientAddr(clientAddr)
 	if !migrated {
-		return oldKey, newKey, false
+		if newIPKey != session.clientIPKey {
+			s.releaseIPSession(newIPKey)
+		}
+		return oldKey, newKey, false, nil
+	}
+	if newIPKey != session.clientIPKey {
+		s.releaseIPSession(session.clientIPKey)
+		session.clientIPKey = newIPKey
 	}
 	if value, ok := s.sessions.Load(newKey); ok {
 		if existing, ok := value.(*rawRaknetifySession); ok && existing != session {
@@ -334,11 +404,25 @@ func (s *rawRaknetifyServer) migrateSessionClient(session *rawRaknetifySession, 
 	if oldKey != "" {
 		s.sessions.CompareAndDelete(oldKey, session)
 	}
-	return oldKey, newKey, true
+	return oldKey, newKey, true, nil
 }
 
 func (s *rawRaknetifyServer) copyClientToBackend(session *rawRaknetifySession) {
+	var nextWrite time.Time
 	for packet := range session.toBackend {
+		if session.pacingInterval > 0 && !nextWrite.IsZero() {
+			if delay := time.Until(nextWrite); delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-timer.C:
+				case <-session.done:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
+				}
+			}
+		}
 		if session.writeDeadline > 0 {
 			_ = session.backendConn.SetWriteDeadline(time.Now().Add(session.writeDeadline))
 		}
@@ -347,6 +431,9 @@ func (s *rawRaknetifyServer) copyClientToBackend(session *rawRaknetifySession) {
 			s.log.V(1).Info("raw raknetify backend write failed, closing session", "clientAddr", session.currentClientAddr(), "backendAddr", session.backendConn.RemoteAddr(), "error", err)
 			s.closeSession(session, "backend_write_error")
 			return
+		}
+		if session.pacingInterval > 0 {
+			nextWrite = time.Now().Add(session.pacingInterval)
 		}
 	}
 }
@@ -368,7 +455,7 @@ func (s *rawRaknetifyServer) copyBackendToClient(session *rawRaknetifySession) {
 			s.closeSession(session, "no_client_addr")
 			return
 		}
-		if _, err = s.writeToClient(clientAddr, buf[:n]); err != nil {
+		if _, err = s.writeToClient(session, clientAddr, buf[:n]); err != nil {
 			rawRaknetifyMetrics.recordWriteFailure("backend_to_client", "write_error")
 			s.log.V(1).Info("closing raw raknetify session after client write failed", "clientAddr", clientAddr, "backendAddr", session.backendConn.RemoteAddr(), "error", err)
 			s.closeSession(session, "client_write_error")
@@ -377,16 +464,15 @@ func (s *rawRaknetifyServer) copyBackendToClient(session *rawRaknetifySession) {
 	}
 }
 
-func (s *rawRaknetifyServer) writeToClient(clientAddr net.Addr, packet []byte) (int, error) {
+func (s *rawRaknetifyServer) writeToClient(session *rawRaknetifySession, clientAddr net.Addr, packet []byte) (int, error) {
 	if udpConn, ok := s.conn.(*net.UDPConn); ok {
-		// clientTOS is initialized to -1, so the first call always sets TOS.
-		// Subsequent calls only update TOS if it has changed.
 		s.tosMu.Lock()
-		if s.clientTOS != rawRaknetifyDefaultIPTOS {
-			setRawRaknetifyUDPQoS(s.log, "listener", udpConn, rawRaknetifyDefaultIPTOS)
-			s.clientTOS = rawRaknetifyDefaultIPTOS
+		defer s.tosMu.Unlock()
+		if s.clientTOS != session.clientTOS {
+			setRawRaknetifyUDPQoS(s.log, "listener", udpConn, session.clientTOS)
+			s.clientTOS = session.clientTOS
 		}
-		s.tosMu.Unlock()
+		return s.conn.WriteTo(packet, clientAddr)
 	}
 	return s.conn.WriteTo(packet, clientAddr)
 }
@@ -403,9 +489,8 @@ func (s *rawRaknetifyServer) closeSession(session *rawRaknetifySession, reason s
 	if session.tokenKey != "" {
 		s.tokenSessions.CompareAndDelete(session.tokenKey, session)
 	}
-	s.migrationMu.Unlock()
-
 	s.finalizeSessionClose(session, reason)
+	s.migrationMu.Unlock()
 }
 
 func (s *rawRaknetifyServer) finalizeSessionClose(session *rawRaknetifySession, reason string) {
@@ -416,10 +501,53 @@ func (s *rawRaknetifyServer) finalizeSessionClose(session *rawRaknetifySession, 
 		s.tokenSessions.CompareAndDelete(session.tokenKey, session)
 	}
 	if session.close() {
+		s.releaseIPSession(session.clientIPKey)
 		s.sessionCount.Add(-1)
 		rawRaknetifyMetrics.addActiveSessions(-1)
 		rawRaknetifyMetrics.recordSessionEvent("closed", reason)
 	}
+}
+
+func (s *rawRaknetifyServer) rawRouteFingerprint(host string) (string, error) {
+	matchedHost, route, _ := FindRouteWithGroups(host, s.routes()...)
+	if route == nil || !route.Raknetify.Enabled || route.RaknetifyMode() != config.RaknetifyModeRawPassthrough {
+		return "", fmt.Errorf("no raw raknetify route configured for host %s", host)
+	}
+	b, err := json.Marshal([]any{route.Host, route.Backend, route.Strategy, route.Raknetify})
+	if err != nil {
+		return "", fmt.Errorf("marshal raw raknetify route %s: %w", matchedHost, err)
+	}
+	return string(b), nil
+}
+
+func rawRaknetifyClientIPKey(addr net.Addr) string {
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return host
+	}
+	return addr.String()
+}
+
+func (s *rawRaknetifyServer) reserveIPSession(ip string, limit int) bool {
+	s.quotaMu.Lock()
+	defer s.quotaMu.Unlock()
+	if s.sessionsPerIP == nil {
+		s.sessionsPerIP = make(map[string]int)
+	}
+	if s.sessionsPerIP[ip] >= limit {
+		return false
+	}
+	s.sessionsPerIP[ip]++
+	return true
+}
+
+func (s *rawRaknetifyServer) releaseIPSession(ip string) {
+	s.quotaMu.Lock()
+	defer s.quotaMu.Unlock()
+	if s.sessionsPerIP[ip] <= 1 {
+		delete(s.sessionsPerIP, ip)
+		return
+	}
+	s.sessionsPerIP[ip]--
 }
 
 func (s *rawRaknetifyServer) closeAllSessions() {

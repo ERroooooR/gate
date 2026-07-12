@@ -28,3 +28,10 @@ func TestApplyDisabledNoop(t *testing.T) {
 	require.NoError(t, Apply(client, Options{}))
 	require.NoError(t, Apply(client, Options{Enabled: true}))
 }
+
+func TestOptionsValidate(t *testing.T) {
+	require.Error(t, (Options{Enabled: true, RateBytesPerSecond: MinRateBytesPerSecond - 1}).Validate())
+	require.Error(t, (Options{Enabled: true, RateBytesPerSecond: MinRateBytesPerSecond, CwndGain: MinCwndGain - 1}).Validate())
+	require.Error(t, (Options{Enabled: true, RateBytesPerSecond: MinRateBytesPerSecond, CwndGain: MaxCwndGain + 1}).Validate())
+	require.NoError(t, (Options{Enabled: true, RateBytesPerSecond: MinRateBytesPerSecond, CwndGain: MinCwndGain}).Validate())
+}

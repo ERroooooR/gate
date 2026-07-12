@@ -18,6 +18,32 @@ config:
     # If enabled, the proxy will act as a lightweight reverse proxy to support new types of deployment architecture.
     # Default: false
     enabled: true
+    # Optional WSMC-compatible WebSocket listener on a separate TCP port.
+    websocket:
+      enabled: false
+      bind: 0.0.0.0:25567
+      path: /mc
+      # Only requests arriving from these proxies may supply X-Forwarded-For.
+      trustedProxies: [127.0.0.1/32, '::1/128']
+      forwardedForHeader: X-Forwarded-For
+      readLimit: 16777216
+      framePayloadSize: 65536
+      minFramePayloadSize: 4096
+      adaptiveFraming: true
+      coalesceWindow: 200us
+      coalesceLimit: 65536
+      maxPendingBytes: 4194304
+      backpressureTimeout: 10s
+      idleTimeout: 90s
+      tcpNoDelay: true
+      tcpKeepAlive: 30s
+      tcpKeepAliveInterval: 10s
+      tcpKeepAliveCount: 3
+      # Linux only; 0 leaves TCP_NOTSENT_LOWAT unchanged.
+      tcpNotSentLowAt: 0
+      handshakeTimeout: 10s
+      maxConnectionsPerIP: 64
+      compression: false
     # The routes that the proxy redirects player connections to based on matching the virtual host address.
     # The routes are matched in order of appearance.
     # Examples:
@@ -26,15 +52,23 @@ config:
       - host: localhost
         # The backend server to connect to if matched.
         backend: localhost:25566
+        # translate unwraps WebSocket into a Minecraft TCP stream.
+        # raw-passthrough forwards the stream to a WSMC WebSocket backend.
+        websocket:
+          enabled: false
+          mode: translate
         # Enable Raknetify for this route only.
-        # Modes:
-        # - translate: Raknetify client -> Gate RakNet -> vanilla TCP backend
-        # - passthrough: Raknetify client -> Gate RakNet -> Raknetify/RakNet backend
-        # - raw-passthrough: Raknetify client -> Gate UDP passthrough -> Raknetify/RakNet backend
+        # Raw passthrough: Raknetify client -> Gate UDP passthrough -> Raknetify/RakNet backend.
         #   raw-passthrough clients must use the raknetg; or raknetgl; address prefix.
         raknetify:
           enabled: false
-          mode: translate
+          mode: raw-passthrough
+          # rawPassthrough:
+          #   idleTimeout: 60s
+          #   writeTimeout: 5s
+          #   pacingInterval: 0s
+          #   queueSize: 256
+          #   maxSessionsPerIP: 64
         # The optional fallback status response when all backends of this route are offline.
         fallback:
           motd: |

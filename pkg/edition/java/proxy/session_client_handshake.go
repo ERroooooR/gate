@@ -83,6 +83,11 @@ func (h *handshakeSessionHandler) HandlePacket(p *proto.PacketContext) {
 }
 
 func (h *handshakeSessionHandler) handleHandshake(handshake *packet.Handshake, pc *proto.PacketContext) {
+	if wsConn, ok := netmc.Assert[interface{ WebSocketVirtualHost() string }](h.conn); ok {
+		if virtualHost := wsConn.WebSocketVirtualHost(); virtualHost != "" {
+			lite.OverrideHandshakeHost(pc, handshake, virtualHost)
+		}
+	}
 	// The client sends the next wanted state in the Handshake packet.
 	nextState := stateForProtocol(handshake.NextStatus)
 	if nextState == nil {

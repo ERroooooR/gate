@@ -35,7 +35,7 @@ config:
 - Lite 后端 TCP 连接：`pkg/edition/java/lite/forward.go` 的 `dialRoute`。
 - Full Proxy 后端 TCP 连接：`pkg/edition/java/proxy/server.go` 的 `(*serverConnection).dial`。
 
-如果启用后系统不支持 TCP Brutal，或内核没有加载 `tcp-brutal` 模块，Gate 会记录日志，但不会因为设置失败而直接断开普通连接。
+非 Linux 平台会安全地跳过 TCP Brutal。Linux 上如果内核没有加载 `tcp-brutal` 模块，Gate 会记录日志，但不会因为设置失败而直接断开普通连接；如果参数设置失败，Gate 会尝试恢复连接原来的拥塞控制算法。
 
 ## 代码位置
 

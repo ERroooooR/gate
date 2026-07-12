@@ -519,3 +519,13 @@ func TestTCPBrutalDefaultCwndGainAndNoopWarning(t *testing.T) {
 	assert.Contains(t, warns[0].Error(), "TCP Brutal is enabled")
 	require.Equal(t, uint32(15), cfg.TCPBrutal.EffectiveCwndGain())
 }
+
+func TestTCPBrutalRejectsInvalidCwndGain(t *testing.T) {
+	cfg := DefaultConfig
+	cfg.TCPBrutal.Enabled = true
+	cfg.TCPBrutal.DownMbps = 10
+	cfg.TCPBrutal.CwndGain = 81
+	_, errs := cfg.Validate()
+	require.NotEmpty(t, errs)
+	assert.Contains(t, errs[0].Error(), "cwndGain")
+}

@@ -3,6 +3,7 @@ package lite
 import (
 	"encoding/binary"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -213,6 +214,53 @@ func TestRawRaknetifyV2HintMigratesClientAddress(t *testing.T) {
 	}
 	if current := first.currentClientAddr().String(); current != nextAddr.String() {
 		t.Fatalf("session client address = %s, want %s", current, nextAddr)
+	}
+}
+
+func TestRawRaknetifyQueueSizeAndPerIPLimit(t *testing.T) {
+	srv, clientAddr, cleanup := newRawRaknetifyTestServer(t)
+	defer cleanup()
+	originalRoutes := srv.routes
+	srv.routes = func() []config.Route {
+		routes := originalRoutes()
+		routes[0].Raknetify.RawPassthrough.QueueSize = 7
+		routes[0].Raknetify.RawPassthrough.MaxSessionsPerIP = 1
+		return routes
+	}
+	first, err := srv.ensureSession(clientAddr, rawRaknetifyRouteHint{host: "example.com", token: "0123456789abcdef", hasToken: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap(first.toBackend) != 7 {
+		t.Fatalf("queue capacity = %d, want 7", cap(first.toBackend))
+	}
+	secondAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:45679")
+	_, err = srv.ensureSession(secondAddr, rawRaknetifyRouteHint{host: "example.com", token: "fedcba9876543210", hasToken: true})
+	if err == nil || !strings.Contains(err.Error(), "per-IP session limit") {
+		t.Fatalf("expected per-IP limit error, got %v", err)
+	}
+}
+
+func TestRawRaknetifyRouteChangeReplacesSession(t *testing.T) {
+	srv, clientAddr, cleanup := newRawRaknetifyTestServer(t)
+	defer cleanup()
+	hint := rawRaknetifyRouteHint{host: "example.com", token: "0123456789abcdef", hasToken: true}
+	first, err := srv.ensureSession(clientAddr, hint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalRoutes := srv.routes
+	srv.routes = func() []config.Route {
+		routes := originalRoutes()
+		routes[0].Raknetify.RawPassthrough.QOS.Mode = config.RaknetifyQOSModeClear
+		return routes
+	}
+	second, err := srv.ensureSession(clientAddr, hint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("route change reused stale session")
 	}
 }
 

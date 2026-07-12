@@ -7,6 +7,8 @@ import (
 	"net"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 type syscallConn interface {
@@ -31,6 +33,7 @@ func apply(conn net.Conn, options Options) error {
 
 	var controlErr error
 	if err := rawConn.Control(func(fd uintptr) {
+		previous, previousErr := unix.GetsockoptString(int(fd), syscall.IPPROTO_TCP, syscall.TCP_CONGESTION)
 		controlErr = syscall.SetsockoptString(int(fd), syscall.IPPROTO_TCP, syscall.TCP_CONGESTION, CongestionControl)
 		if controlErr != nil {
 			return
@@ -51,6 +54,11 @@ func apply(conn net.Conn, options Options) error {
 		)
 		if errno != 0 {
 			controlErr = errno
+			if previousErr == nil && previous != "" {
+				if rollbackErr := syscall.SetsockoptString(int(fd), syscall.IPPROTO_TCP, syscall.TCP_CONGESTION, previous); rollbackErr != nil {
+					controlErr = fmt.Errorf("set params: %w; rollback congestion control to %q: %v", errno, previous, rollbackErr)
+				}
+			}
 		}
 	}); err != nil {
 		return fmt.Errorf("control TCP socket: %w", err)

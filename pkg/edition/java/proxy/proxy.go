@@ -235,40 +235,46 @@ func (p *Proxy) Start(ctx context.Context) error {
 		lnCtx, stop := context.WithCancel(ctx)
 		eg.Go(func() error {
 			defer stop()
-			opts := lite.RaknetifyOptions{
+			opts := lite.RaknetifyRawOptions{
 				Bind: addr,
 				Routes: func() []liteconfig.Route {
 					return p.config().Lite.Routes
 				},
-				DialTimeout:      time.Duration(p.config().ConnectionTimeout),
-				ReadTimeout:      time.Duration(p.config().ReadTimeout),
-				WriteTimeout:     time.Duration(p.config().ReadTimeout),
-				CompressionLevel: p.config().Compression.Level,
-				StrategyManager:  p.lite.StrategyManager(),
-				BackendTCPBrutal: func() tcpbrutal.Options {
-					return p.config().TCPBrutal.BackendOptions()
-				},
-				Logger: p.log,
+				StrategyManager: p.lite.StrategyManager(),
+				Logger:          p.log,
 			}
-			if lite.HasRawRaknetifyRoutes(p.config().Lite.Routes) {
-				return lite.ServeRaknetifyRaw(lnCtx, opts)
-			}
-			return lite.ServeRaknetify(lnCtx, opts)
+			return lite.ServeRaknetifyRaw(lnCtx, opts)
 		})
 		return stop
 	}
-	raknetifyMode := func(c *config.Config) string {
-		if !c.Lite.Enabled || !lite.HasRaknetifyRoutes(c.Lite.Routes) {
-			return ""
-		}
-		if lite.HasRawRaknetifyRoutes(c.Lite.Routes) {
-			return "raw"
-		}
-		return "framed"
+	raknetifyEnabled := func(c *config.Config) bool {
+		return c.Lite.Enabled && lite.HasRawRaknetifyRoutes(c.Lite.Routes)
 	}
 	var stopRaknetify context.CancelFunc
-	if raknetifyMode(p.cfg) != "" {
+	if raknetifyEnabled(p.cfg) {
 		stopRaknetify = listenRaknetify(p.cfg.Bind)
+	}
+	listenWebSocket := func() context.CancelFunc {
+		lnCtx, stop := context.WithCancel(ctx)
+		eg.Go(func() error {
+			defer stop()
+			return lite.ServeWebSocket(lnCtx, lite.WebSocketOptions{
+				Config:           func() liteconfig.Config { return p.config().Lite },
+				StrategyManager:  p.lite.StrategyManager(),
+				HandleConn:       p.HandleConn,
+				ClientTCPBrutal:  func() tcpbrutal.Options { return p.config().TCPBrutal.ClientOptions() },
+				BackendTCPBrutal: func() tcpbrutal.Options { return p.config().TCPBrutal.BackendOptions() },
+				Logger:           p.log,
+			})
+		})
+		return stop
+	}
+	webSocketEnabled := func(c *config.Config) bool {
+		return c.Lite.Enabled && c.Lite.WebSocket.Enabled
+	}
+	var stopWebSocket context.CancelFunc
+	if webSocketEnabled(p.cfg) {
+		stopWebSocket = listenWebSocket()
 	}
 
 	// Listen for config reloads until we exit
@@ -283,21 +289,32 @@ func (p *Proxy) Start(ctx context.Context) error {
 				stopRaknetify()
 				stopRaknetify = nil
 			}
-			if raknetifyMode(e.Config) != "" {
+			if raknetifyEnabled(e.Config) {
 				stopRaknetify = listenRaknetify(e.Config.Bind)
 			}
 			p.closeMu.Unlock()
 		}
-		prevRaknetifyMode := raknetifyMode(e.PrevConfig)
-		nextRaknetifyMode := raknetifyMode(e.Config)
-		if e.PrevConfig.Bind == e.Config.Bind && prevRaknetifyMode != nextRaknetifyMode {
+		prevRaknetifyEnabled := raknetifyEnabled(e.PrevConfig)
+		nextRaknetifyEnabled := raknetifyEnabled(e.Config)
+		if e.PrevConfig.Bind == e.Config.Bind && prevRaknetifyEnabled != nextRaknetifyEnabled {
 			p.closeMu.Lock()
 			if stopRaknetify != nil {
 				stopRaknetify()
 				stopRaknetify = nil
 			}
-			if nextRaknetifyMode != "" {
+			if nextRaknetifyEnabled {
 				stopRaknetify = listenRaknetify(e.Config.Bind)
+			}
+			p.closeMu.Unlock()
+		}
+		if !reflect.DeepEqual(e.PrevConfig.Lite.WebSocket, e.Config.Lite.WebSocket) || webSocketEnabled(e.PrevConfig) != webSocketEnabled(e.Config) {
+			p.closeMu.Lock()
+			if stopWebSocket != nil {
+				stopWebSocket()
+				stopWebSocket = nil
+			}
+			if webSocketEnabled(e.Config) {
+				stopWebSocket = listenWebSocket()
 			}
 			p.closeMu.Unlock()
 		}
