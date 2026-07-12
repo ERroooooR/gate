@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.69.1](https://github.com/ERroooooR/gate/compare/v0.69.0...v0.69.1) (2026-07-12)
+
+
+### Bug Fixes
+
+* linux/386 build and fork-safe dispatch-moxy-bump ([83e933e](https://github.com/ERroooooR/gate/commit/83e933e52ed8ac5c04155f27c9e269d77236b14d))
+
 ## [0.69.0](https://github.com/ERroooooR/gate/compare/v0.68.26...v0.69.0) (2026-07-12)
 
 
