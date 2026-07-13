@@ -146,7 +146,9 @@ func TestWebSocketTranslateMatchesWSMCBinaryFrameContract(t *testing.T) {
 	defer httpServer.Close()
 	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/mc", &websocket.DialOptions{Host: "wsmc.example.com"})
 	require.NoError(t, err)
-	defer ws.CloseNow()
+	t.Cleanup(func() {
+		require.NoError(t, ws.CloseNow())
+	})
 	ws.SetReadLimit(1 << 20)
 	require.NoError(t, ws.Write(ctx, websocket.MessageBinary, []byte{1, 2}))
 	require.NoError(t, ws.Write(ctx, websocket.MessageBinary, []byte{3, 4, 5}))
