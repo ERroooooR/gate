@@ -87,13 +87,16 @@ func ServeWebSocket(ctx context.Context, opts WebSocketOptions) error {
 }
 
 func (s *webSocketServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	requestStarted := time.Now()
 	cfg := s.opts.Config()
 	wsCfg := cfg.WebSocket
 	if !wsCfg.Enabled {
+		wsmcMetrics.request("disabled", "unknown", time.Since(requestStarted))
 		http.Error(w, "WebSocket transport disabled", http.StatusServiceUnavailable)
 		return
 	}
 	if path := wsCfg.EffectivePath(); path != "" && r.URL.Path != path {
+		wsmcMetrics.request("invalid_path", "unknown", time.Since(requestStarted))
 		http.NotFound(w, r)
 		return
 	}
@@ -101,12 +104,14 @@ func (s *webSocketServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	virtualHost := webSocketHost(r.Host)
 	matchedHost, route, groups := FindRouteWithGroups(virtualHost, cfg.Routes...)
 	if route == nil || !route.WebSocket.Enabled {
+		wsmcMetrics.request("no_route", "unknown", time.Since(requestStarted))
 		http.Error(w, "No WebSocket route", http.StatusNotFound)
 		return
 	}
 
 	remoteAddr, clientIP := s.clientAddr(r, wsCfg)
 	if !s.acquireIP(clientIP, wsCfg.EffectiveMaxConnectionsPerIP()) {
+		wsmcMetrics.request("quota_rejected", string(route.WebSocket.EffectiveMode()), time.Since(requestStarted))
 		http.Error(w, "Too many WebSocket connections", http.StatusTooManyRequests)
 		return
 	}
@@ -118,12 +123,19 @@ func (s *webSocketServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	wsConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: compression})
 	if err != nil {
+		wsmcMetrics.request("handshake_failed", string(route.WebSocket.EffectiveMode()), time.Since(requestStarted))
 		s.opts.Logger.V(1).Info("websocket handshake failed", "error", err, "remoteAddr", r.RemoteAddr)
 		return
 	}
 	connCtx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
-	client := newWebSocketStreamConn(connCtx, wsConn, wsCfg, remoteAddr, virtualHost)
+	mode := string(route.WebSocket.EffectiveMode())
+	client := newWebSocketStreamConn(connCtx, wsConn, wsCfg, remoteAddr, virtualHost, mode)
+	wsmcMetrics.request("accepted", mode, time.Since(requestStarted))
+	wsmcMetrics.addActive(mode, 1)
+	defer wsmcMetrics.addActive(mode, -1)
+	sessionStarted := time.Now()
+	defer func() { wsmcMetrics.session(mode, time.Since(sessionStarted)) }()
 
 	log := s.opts.Logger.WithName("lite").WithName("websocket").WithValues(
 		"clientAddr", remoteAddr, "virtualHost", virtualHost, "route", matchedHost,
@@ -247,7 +259,7 @@ func (s *webSocketServer) dialRawBackend(
 	if err != nil {
 		return nil, err
 	}
-	return newWebSocketStreamConn(ctx, wsConn, listenerCfg, nil, ""), nil
+	return newWebSocketStreamConn(ctx, wsConn, listenerCfg, nil, "", "raw-backend"), nil
 }
 
 type webSocketListener struct {
