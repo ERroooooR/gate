@@ -25,11 +25,12 @@ func newWebSocketStreamConn(
 	cfg config.WebSocketListenerConfig,
 	remoteAddr net.Addr,
 	virtualHost string,
+	mode string,
 ) *webSocketStreamConn {
 	stream := websocket.NetConn(ctx, wsConn, websocket.MessageBinary)
 	// NetConn disables the read limit, so restore it after construction.
 	wsConn.SetReadLimit(cfg.EffectiveReadLimit())
-	optimized := newOptimizedWebSocketConn(stream, cfg)
+	optimized := newOptimizedWebSocketConn(stream, cfg, mode)
 	return &webSocketStreamConn{Conn: optimized, remoteAddr: remoteAddr, virtualHost: virtualHost}
 }
 
@@ -61,15 +62,17 @@ type optimizedWebSocketConn struct {
 
 	targetFrame atomic.Int64
 	lastActive  atomic.Int64
+	mode        string
 }
 
-func newOptimizedWebSocketConn(conn net.Conn, cfg config.WebSocketListenerConfig) *optimizedWebSocketConn {
+func newOptimizedWebSocketConn(conn net.Conn, cfg config.WebSocketListenerConfig, mode string) *optimizedWebSocketConn {
 	c := &optimizedWebSocketConn{
 		Conn:         conn,
 		cfg:          cfg,
 		queue:        make(chan []byte, 1024),
 		done:         make(chan struct{}),
 		spaceChanged: make(chan struct{}),
+		mode:         mode,
 	}
 	c.targetFrame.Store(int64(cfg.EffectiveFramePayloadSize()))
 	c.touch()
@@ -82,6 +85,7 @@ func (c *optimizedWebSocketConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
 		c.touch()
+		wsmcMetrics.read(c.mode, n)
 	}
 	return n, err
 }
@@ -140,6 +144,7 @@ func (c *optimizedWebSocketConn) Close() error {
 		select {
 		case <-changed:
 		case <-timer.C:
+			wsmcMetrics.event(c.mode, "close_flush_timeout")
 			c.fail(errors.New("websocket close flush timeout"))
 			return c.currentError()
 		case <-c.done:
@@ -166,6 +171,7 @@ func (c *optimizedWebSocketConn) reserve(size int) error {
 		select {
 		case <-changed:
 		case <-timer.C:
+			wsmcMetrics.event(c.mode, "backpressure_timeout")
 			c.fail(errors.New("websocket backpressure timeout"))
 			return c.currentError()
 		case <-c.done:
@@ -260,32 +266,39 @@ func (c *optimizedWebSocketConn) writeLoop() {
 			payload = append(payload, part...)
 		}
 		started := time.Now()
-		err := c.writeFrames(payload)
+		frames, err := c.writeFrames(payload)
 		elapsed := time.Since(started)
 		c.release(batchBytes)
 		if err != nil {
+			wsmcMetrics.event(c.mode, "write_failure")
 			c.fail(err)
 			return
 		}
 		c.touch()
 		c.adjustFrameSize(elapsed)
+		c.pendingMu.Lock()
+		pending := c.pendingBytes
+		c.pendingMu.Unlock()
+		wsmcMetrics.write(c.mode, frames, batchBytes, pending, int(c.targetFrame.Load()), elapsed)
 	}
 }
 
-func (c *optimizedWebSocketConn) writeFrames(payload []byte) error {
+func (c *optimizedWebSocketConn) writeFrames(payload []byte) (int, error) {
 	frameSize := int(c.targetFrame.Load())
+	frames := 0
 	for len(payload) > 0 {
 		n := min(len(payload), frameSize)
 		written, err := c.Conn.Write(payload[:n])
 		if err != nil {
-			return err
+			return frames, err
 		}
 		if written != n {
-			return io.ErrShortWrite
+			return frames, io.ErrShortWrite
 		}
+		frames++
 		payload = payload[n:]
 	}
-	return nil
+	return frames, nil
 }
 
 func (c *optimizedWebSocketConn) adjustFrameSize(writeDuration time.Duration) {
@@ -316,6 +329,7 @@ func (c *optimizedWebSocketConn) idleLoop() {
 		case now := <-ticker.C:
 			last := time.Unix(0, c.lastActive.Load())
 			if now.Sub(last) >= idle {
+				wsmcMetrics.event(c.mode, "idle_timeout")
 				c.fail(errors.New("websocket idle timeout"))
 				return
 			}

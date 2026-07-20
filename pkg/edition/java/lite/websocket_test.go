@@ -112,6 +112,60 @@ func TestWebSocketRawPassthrough(t *testing.T) {
 	require.Equal(t, want, got)
 }
 
+// WSMC's current client (WebSocketClientHandler/WebSocketHandler) uses RFC6455
+// V13, sends every Minecraft ByteBuf as a binary message and exposes received
+// binary message payloads as one continuous Netty byte stream. Verify both
+// boundaries against that contract rather than only using websocket.NetConn.
+func TestWebSocketTranslateMatchesWSMCBinaryFrameContract(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cfg := config.Config{
+		WebSocket: config.WebSocketListenerConfig{
+			Enabled: true, Path: "/mc", FramePayloadSize: 65536,
+			ReadLimit: 1 << 20, MaxConnectionsPerIP: 4,
+		},
+		Routes: []config.Route{{
+			Host: []string{"wsmc.example.com"}, Backend: []string{"127.0.0.1:25565"},
+			WebSocket: config.WebSocketRouteConfig{Enabled: true, Mode: config.WebSocketModeTranslate},
+		}},
+	}
+	server := &webSocketServer{
+		ctx: ctx,
+		opts: WebSocketOptions{
+			Config: func() config.Config { return cfg }, StrategyManager: NewStrategyManager(), Logger: logr.Discard(),
+			HandleConn: func(conn net.Conn) {
+				defer conn.Close()
+				in := make([]byte, 5)
+				_, _ = io.ReadFull(conn, in)
+				_, _ = conn.Write(make([]byte, 65536*2+7))
+			},
+		},
+		activeIPs: make(map[string]int),
+	}
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/mc", &websocket.DialOptions{Host: "wsmc.example.com"})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, ws.CloseNow())
+	})
+	ws.SetReadLimit(1 << 20)
+	require.NoError(t, ws.Write(ctx, websocket.MessageBinary, []byte{1, 2}))
+	require.NoError(t, ws.Write(ctx, websocket.MessageBinary, []byte{3, 4, 5}))
+	total := 0
+	frames := 0
+	for total < 65536*2+7 {
+		typ, payload, readErr := ws.Read(ctx)
+		require.NoError(t, readErr)
+		require.Equal(t, websocket.MessageBinary, typ)
+		require.LessOrEqual(t, len(payload), 65536)
+		total += len(payload)
+		frames++
+	}
+	require.Equal(t, 65536*2+7, total)
+	require.Equal(t, 3, frames)
+}
+
 func TestUntrustedProxyCannotSpoofForwardedFor(t *testing.T) {
 	s := &webSocketServer{}
 	r := httptest.NewRequest(http.MethodGet, "http://example.com/mc", nil)
